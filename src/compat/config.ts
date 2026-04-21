@@ -15,10 +15,50 @@ const BUILTIN_COMMANDS: Record<string, { template: string; description: string }
 		template: [
 			'Display a quick Caveman help card.',
 			'Include modes: lite, full, ultra.',
-			'Include commands: `/caveman`, `/caveman-help`, `/caveman-commit`, `/caveman-review`.',
+			'Include commands: `/caveman`, `/caveman-help`, `/caveman-stack`, `/caveman-status`, `/caveman-memory`, `/caveman-backprop`, `/caveman-commit`, `/caveman-review`, `/ck-spec`, `/ck-build`, `/ck-check`.',
 			'Explain that `full` is default, `/caveman ultra` switches intensity, and `stop caveman` or `normal mode` disables it for the session.',
+			'Explain that `/caveman-stack` uses Caveman compression + CaveKit planning + CaveMem recall as one hybrid loop.',
 			'One-shot help only. Do not change the current mode unless the user explicitly asked to switch mode.',
 			'Write the help card in terse Caveman style.',
+		].join(' '),
+	},
+	'caveman-stack': {
+		description: 'Run full Caveman stack workflow',
+		template: [
+			'Use the full Caveman stack for this task.',
+			'Load and compress long-lived context from `CLAUDE.md`, `AGENTS.md`, `SPEC.md`, and rules before acting.',
+			'Use CaveMem recall for relevant prior prompts, tool history, and mirrored memory notes.',
+			'If `SPEC.md` exists, use CaveKit spec-driven planning. Otherwise use hybrid ad-hoc planning.',
+			'Proceed through phases: load context -> compile prompt -> plan -> edit -> run/tests -> verify.',
+			'If verification fails in spec-driven mode, backprop to `§B BUGS` and `§V INVARIANTS` before continuing.',
+			'Treat `$ARGUMENTS` as the task objective or scope override.',
+		].join(' '),
+	},
+	'caveman-status': {
+		description: 'Show current Caveman stack runtime status',
+		template: [
+			'Show the current Caveman stack runtime state for this session.',
+			'Report current phase, active plan mode, plan summary, next steps, and latest verification results.',
+			'Prefer using the runtime status tool if available and summarize the result tersely.',
+			'No code edits. Status only.',
+		].join(' '),
+	},
+	'caveman-memory': {
+		description: 'Recall relevant CaveMem and memory context',
+		template: [
+			'Recall task-relevant memory before acting.',
+			'Use both OpenHarness memory files and CaveMem-backed session memory for the current project.',
+			'Summarize only the observations that change planning, editing, or verification decisions.',
+			'Treat `$ARGUMENTS` as the recall query or focus area.',
+		].join(' '),
+	},
+	'caveman-backprop': {
+		description: 'Backprop latest failure into CaveKit spec',
+		template: [
+			'Inspect the latest failed or flaky verification and backprop it into `SPEC.md` when the project uses CaveKit.',
+			'Update `§B BUGS`, strengthen `§V INVARIANTS`, and keep `§T TASKS` status honest.',
+			'If no spec exists, explain the failure and propose the invariant that should exist instead of inventing a spec unasked.',
+			'Treat `$ARGUMENTS` as an optional failure focus, command, or subsystem.',
 		].join(' '),
 	},
 	'caveman-commit': {

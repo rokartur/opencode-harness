@@ -4,6 +4,7 @@ import { getProjectMemoryDir } from './memory/paths.js'
 import { dirExists } from './shared/fs.js'
 import { statSync } from 'node:fs'
 import type { CompatibilityReport } from './shared/types.js'
+import type { SessionRuntimeSnapshot } from './runtime/index.js'
 
 const z = tool.schema
 
@@ -238,6 +239,41 @@ export function createHookLogTool(getHookLog: () => HookExecutionLog): ToolDefin
 					const subj = e.subject ? ` on ${e.subject}` : ''
 					const reason = e.reason ? ` — ${e.reason.slice(0, 80)}` : ''
 					lines.push(`- [${time}] ${e.event} (${e.kind})${subj} ${status} (${e.durationMs}ms)${reason}`)
+				}
+			}
+
+			return lines.join('\n')
+		},
+	})
+}
+
+export function createRuntimeStatusTool(
+	getRuntimeSnapshot: (sessionID: string) => SessionRuntimeSnapshot | null,
+): ToolDefinition {
+	return tool({
+		description: 'Show hybrid runtime status: current phase, active plan, and recent verification results.',
+		args: {},
+		async execute(_args, ctx) {
+			const snapshot = getRuntimeSnapshot(ctx.sessionID)
+			if (!snapshot) return 'No hybrid runtime state for this session.'
+
+			const lines: string[] = ['## Hybrid Runtime Status', '', `Phase: ${snapshot.phase}`]
+			if (snapshot.plan) {
+				lines.push(`Mode: ${snapshot.plan.mode}`)
+				lines.push(`Goal: ${snapshot.plan.goal}`)
+				lines.push(`Summary: ${snapshot.plan.summary}`)
+				if (snapshot.plan.steps.length > 0) {
+					lines.push('', '### Steps')
+					for (const step of snapshot.plan.steps.slice(0, 5)) {
+						lines.push(`- ${step.id} [${step.kind}] ${step.title}`)
+					}
+				}
+			}
+
+			if (snapshot.verificationRecords.length > 0) {
+				lines.push('', '### Verification')
+				for (const record of snapshot.verificationRecords.slice(-5)) {
+					lines.push(`- ${record.status}: ${record.command}`)
 				}
 			}
 

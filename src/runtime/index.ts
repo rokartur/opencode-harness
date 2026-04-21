@@ -8,5 +8,7 @@ export type {
 	ExecutionPhase,
 	ExecutionPlan,
 	ExecutionStep,
+	VerificationStatus,
+	VerificationRecord,
 	SessionRuntimeSnapshot,
 } from './types.js'

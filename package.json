@@ -1,7 +1,7 @@
 {
-	"name": "opencode-harness",
+	"name": "oc-harness",
 	"version": "0.1.0",
-	"description": "OpenCode plugin that ports the OpenHarness compatibility layer, plugin loader, context injection, memory, and compaction helpers.",
+	"description": "oc-harness",
 	"license": "MIT",
 	"files": [
 		"dist",

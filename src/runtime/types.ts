@@ -32,8 +32,19 @@ export interface ExecutionPlan {
 	summary: string
 	steps: ExecutionStep[]
 	sourceArtifacts: string[]
+	specSource: string
 	memoryRefs: string[]
 	validationCommands: string[]
+}
+
+export type VerificationStatus = 'pass' | 'fail' | 'flaky' | 'unknown'
+
+export interface VerificationRecord {
+	command: string
+	status: VerificationStatus
+	summary: string
+	exitCode: number | null
+	timestamp: number
 }
 
 export interface SessionRuntimeSnapshot {
@@ -41,5 +52,6 @@ export interface SessionRuntimeSnapshot {
 	compiledPrompt: CompiledPrompt | null
 	plan: ExecutionPlan | null
 	verificationSummary: string[]
+	verificationRecords: VerificationRecord[]
 	updatedAt: number
 }

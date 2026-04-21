@@ -40,6 +40,7 @@ export function buildExecutionPlan(input: {
 				acceptance: buildAcceptance(task, validationCommands),
 			})),
 			sourceArtifacts,
+			specSource: spec?.source ?? '',
 			memoryRefs,
 			validationCommands,
 		}
@@ -52,6 +53,7 @@ export function buildExecutionPlan(input: {
 		summary: `Ad-hoc runtime plan. Inspect likely files, apply smallest correct edit, then verify with ${formatValidationList(validationCommands)}.`,
 		steps: adHocSteps,
 		sourceArtifacts,
+		specSource: '',
 		memoryRefs,
 		validationCommands,
 	}

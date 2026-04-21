@@ -36,7 +36,13 @@ import {
 	recordCaveMemSessionSummary,
 	countCaveMemProjectObservations,
 } from './memory/index.js'
-import { HookExecutionLog, createDiagnosticsTool, createMemoryStatsTool, createHookLogTool } from './tui.js'
+import {
+	HookExecutionLog,
+	createDiagnosticsTool,
+	createMemoryStatsTool,
+	createHookLogTool,
+	createRuntimeStatusTool,
+} from './tui.js'
 import { tool as toolFn } from '@opencode-ai/plugin'
 import {
 	compileUserPrompt,
@@ -45,6 +51,8 @@ import {
 	summarizeExecutionPlan,
 	SessionRuntimeTracker,
 } from './runtime/index.js'
+import { classifyVerification } from './runtime/verifier.js'
+import { applyVerificationToSpec } from './runtime/backprop.js'
 import type { PluginConfig, CompatHook, LoadedCompatPlugin } from './shared/types.js'
 import { injectCavememMcp, isCavememAvailable } from './shared/cavemem.js'
 import { isRtkAvailable, rewriteCommandWithRtk } from './shared/rtk.js'
@@ -352,6 +360,14 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				]
 			}),
 			openharness_hook_log: createHookLogTool(() => hookLog),
+			openharness_runtime_status: createRuntimeStatusTool(sessionID => {
+				if (!sessionID) return null
+				return getSessionRuntime(sessionID).snapshot()
+			}),
+			openharness_caveman_stack_status: createRuntimeStatusTool(sessionID => {
+				if (!sessionID) return null
+				return getSessionRuntime(sessionID).snapshot()
+			}),
 		},
 
 		'tool.execute.before':
@@ -416,8 +432,15 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				if (path) sessionState.addArtifact(path)
 			}
 			maybeRecordVerificationState(sessionState, hookInput, toolOutput)
-			const verificationSummary = getVerificationSummary(hookInput, toolOutput)
-			if (verificationSummary) sessionRuntime.noteVerification(verificationSummary)
+			const verification = classifyVerification({
+				tool: hookInput.tool,
+				args: hookInput.args ?? {},
+				output: { output: toolOutput.output, metadata: toolOutput.metadata },
+			})
+			if (verification) {
+				sessionRuntime.noteVerification(verification)
+				applyVerificationToSpec(sessionRuntime.snapshot().plan, verification)
+			}
 			maybeSetNextStep(sessionState, hookInput)
 		},
 
@@ -778,18 +801,6 @@ function maybeRecordVerificationState(
 		sessionState.addVerifiedState(`Verified: ${truncateStr(command, 100)}`)
 		sessionState.setNextStep('Summarize the verified work or continue with the next change.')
 	}
-}
-
-function getVerificationSummary(
-	hookInput: { tool: string; args: any },
-	toolOutput: { title: string; output: string; metadata: any },
-): string {
-	if (hookInput.tool !== 'bash') return ''
-	const command = typeof hookInput.args?.command === 'string' ? hookInput.args.command : ''
-	if (!command) return ''
-	if (!/\b(test|build|typecheck|check|lint)\b/.test(command.toLowerCase())) return ''
-	const exitCode = typeof toolOutput.metadata?.exitCode === 'number' ? toolOutput.metadata.exitCode : 0
-	return `${truncateStr(command, 100)} [${exitCode === 0 ? 'pass' : `fail:${exitCode}`}]`
 }
 
 function maybeSetNextStep(sessionState: SessionStateTracker, hookInput: { tool: string; args: any }): void {

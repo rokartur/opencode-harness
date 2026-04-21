@@ -1,10 +1,17 @@
-import type { CompiledPrompt, ExecutionPhase, ExecutionPlan, SessionRuntimeSnapshot } from './types.js'
+import type {
+	CompiledPrompt,
+	ExecutionPhase,
+	ExecutionPlan,
+	SessionRuntimeSnapshot,
+	VerificationRecord,
+} from './types.js'
 
 export class SessionRuntimeTracker {
 	private phase: ExecutionPhase = 'load-context'
 	private compiledPrompt: CompiledPrompt | null = null
 	private plan: ExecutionPlan | null = null
 	private verificationSummary: string[] = []
+	private verificationRecords: VerificationRecord[] = []
 	private updatedAt = Date.now()
 
 	setPhase(phase: ExecutionPhase): void {
@@ -24,10 +31,12 @@ export class SessionRuntimeTracker {
 		this.updatedAt = Date.now()
 	}
 
-	noteVerification(summary: string): void {
-		if (!summary) return
-		this.verificationSummary.push(summary)
+	noteVerification(record: VerificationRecord): void {
+		if (!record.summary) return
+		this.verificationSummary.push(record.summary)
 		if (this.verificationSummary.length > 6) this.verificationSummary.shift()
+		this.verificationRecords.push(record)
+		if (this.verificationRecords.length > 12) this.verificationRecords.shift()
 		this.phase = 'verify'
 		this.updatedAt = Date.now()
 	}
@@ -51,6 +60,7 @@ export class SessionRuntimeTracker {
 			compiledPrompt: this.compiledPrompt,
 			plan: this.plan,
 			verificationSummary: [...this.verificationSummary],
+			verificationRecords: [...this.verificationRecords],
 			updatedAt: this.updatedAt,
 		}
 	}
@@ -60,6 +70,7 @@ export class SessionRuntimeTracker {
 		this.compiledPrompt = null
 		this.plan = null
 		this.verificationSummary = []
+		this.verificationRecords = []
 		this.updatedAt = Date.now()
 	}
 }
