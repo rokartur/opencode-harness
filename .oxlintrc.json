@@ -1,12 +1,6 @@
 {
 	"$schema": "./node_modules/oxlint/configuration_schema.json",
-	"ignorePatterns": [
-		"node_modules",
-		"dist",
-		"build",
-		"*.lock",
-		"*.md",
-	],
+	"ignorePatterns": ["node_modules", "dist", "build", "*.lock", "*.md"],
 	"plugins": ["react", "jsx-a11y", "typescript", "import", "unicorn", "eslint"],
 	"categories": {
 		"correctness": "error"

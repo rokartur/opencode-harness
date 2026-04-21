@@ -14,7 +14,7 @@
 		"*.env",
 		"*.env.*",
 		"*.log",
-		"*.sh",
+		"*.sh"
 	],
 	"arrowParens": "avoid",
 	"bracketSameLine": false,

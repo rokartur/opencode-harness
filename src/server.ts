@@ -9,6 +9,7 @@ import {
 } from './compat/index.js'
 import { executeHook, matchesHook, mapOpenHarnessEventToOpenCode } from './compat/hooks-executor.js'
 import { discoverExtraContext, discoverClaudeRules } from './context/index.js'
+import { buildCavemanSystemPrompt, compressForCaveman, type CavemanMode } from './context/caveman.js'
 import {
 	SessionStateTracker,
 	buildCompactionContext,
@@ -27,10 +28,15 @@ import {
 import { HookExecutionLog, createDiagnosticsTool, createMemoryStatsTool, createHookLogTool } from './tui.js'
 import { tool as toolFn } from '@opencode-ai/plugin'
 import type { PluginConfig, CompatHook, LoadedCompatPlugin } from './shared/types.js'
+import { isRtkAvailable, rewriteCommandWithRtk } from './shared/rtk.js'
 
 const z = toolFn.schema
 
 export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
+	const cavemanMode = normalizeCavemanMode(options?.cavemanMode)
+	const rtkBinary =
+		typeof options?.rtkBinary === 'string' && options.rtkBinary.trim() ? options.rtkBinary.trim() : 'rtk'
+
 	const config: PluginConfig = {
 		allowProjectPlugins: options?.allowProjectPlugins === true,
 		extraPluginRoots: options?.extraPluginRoots as string[] | undefined,
@@ -42,7 +48,14 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		enableIssueContext: options?.enableIssueContext !== false,
 		enablePrCommentsContext: options?.enablePrCommentsContext !== false,
 		enableActiveRepoContext: options?.enableActiveRepoContext !== false,
+		enableCavemanInputCompression: options?.enableCavemanInputCompression === true,
+		enableCavemanOutputCompression: options?.enableCavemanOutputCompression === true,
+		cavemanMode,
+		enableRtk: options?.enableRtk === true,
+		rtkBinary,
 	}
+
+	const rtkAvailable = config.enableRtk ? isRtkAvailable(rtkBinary) : false
 
 	const cwd = input.directory
 	const roots = discoverPluginRoots(cwd, config)
@@ -70,12 +83,24 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		})
 	}
 
+	if (config.enableRtk && !rtkAvailable) {
+		await input.client.app.log({
+			body: {
+				service: 'opencode-harness',
+				level: 'warn',
+				message: `RTK enabled but binary '${rtkBinary}' is unavailable. Bash rewrite disabled.`,
+			},
+		})
+	}
+
 	const allHooks = plugins.filter(p => p.enabled).flatMap(p => p.hooks)
 
 	const allSkills = plugins.filter(p => p.enabled).flatMap(p => p.skills)
 
 	const sessionStateBySession = new Map<string, SessionStateTracker>()
 	const invokedSkillsBySession = new Map<string, Set<string>>()
+	const persistentHookContextBySession = new Map<string, string[]>()
+	const promptHookContextBySession = new Map<string, string[]>()
 	const hookLog = new HookExecutionLog()
 
 	const lastPromptBySession = new Map<string, string>()
@@ -115,6 +140,8 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		lastPromptBySession.delete(sessionID)
 		sessionStateBySession.delete(sessionID)
 		invokedSkillsBySession.delete(sessionID)
+		persistentHookContextBySession.delete(sessionID)
+		promptHookContextBySession.delete(sessionID)
 	}
 
 	function findMatchingHooks(openCodeEvent: string, subject?: string): CompatHook[] {
@@ -132,16 +159,16 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		openCodeEvent: string,
 		payload: Record<string, unknown>,
 		subject?: string,
-	): Promise<{ blocked: boolean; results: Array<{ success: boolean; output: string }> }> {
+	): Promise<{ blocked: boolean; results: Array<{ kind: CompatHook['kind']; success: boolean; output: string }> }> {
 		const hooks = findMatchingHooks(openCodeEvent, subject)
 		let blocked = false
-		const results: Array<{ success: boolean; output: string }> = []
+		const results: Array<{ kind: CompatHook['kind']; success: boolean; output: string }> = []
 
 		for (const hook of hooks) {
 			const start = Date.now()
 			const result = await executeHook(hook, payload, cwd)
 			const durationMs = Date.now() - start
-			results.push({ success: result.success, output: result.output })
+			results.push({ kind: hook.kind, success: result.success, output: result.output })
 			hookLog.record({
 				event: hook.event,
 				kind: hook.kind,
@@ -158,6 +185,22 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		}
 
 		return { blocked, results }
+	}
+
+	function setHookContext(cache: Map<string, string[]>, sessionID: string, outputs: string[]): void {
+		if (outputs.length === 0) {
+			cache.delete(sessionID)
+			return
+		}
+		cache.set(sessionID, outputs)
+		trimSessionCache(cache, MAX_SESSION_CACHE)
+	}
+
+	function rememberHookContext(sessionID: string, outputs: string[]): void {
+		if (outputs.length === 0) return
+		const merged = new Set([...(persistentHookContextBySession.get(sessionID) ?? []), ...outputs])
+		persistentHookContextBySession.set(sessionID, Array.from(merged))
+		trimSessionCache(persistentHookContextBySession, MAX_SESSION_CACHE)
 	}
 
 	return {
@@ -220,23 +263,36 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			openharness_hook_log: createHookLogTool(() => hookLog),
 		},
 
-		'tool.execute.before': config.enableHooks
-			? async (hookInput, output) => {
-					const subject = hookInput.tool
-					const { blocked } = await runMatchingHooks(
-						'tool.execute.before',
-						{
-							tool_name: hookInput.tool,
-							session_id: hookInput.sessionID,
-							call_id: hookInput.callID,
-						},
-						subject,
-					)
-					if (blocked) {
-						throw new Error(`Blocked by OpenHarness hook for tool '${hookInput.tool}'`)
+		'tool.execute.before':
+			config.enableHooks || config.enableRtk
+				? async (hookInput, output) => {
+						if (config.enableHooks) {
+							const subject = hookInput.tool
+							const { blocked } = await runMatchingHooks(
+								'tool.execute.before',
+								{
+									tool_name: hookInput.tool,
+									session_id: hookInput.sessionID,
+									call_id: hookInput.callID,
+								},
+								subject,
+							)
+							if (blocked) {
+								throw new Error(`Blocked by OpenHarness hook for tool '${hookInput.tool}'`)
+							}
+						}
+
+						if (config.enableRtk && rtkAvailable && hookInput.tool === 'bash') {
+							const command = typeof output.args?.command === 'string' ? output.args.command : ''
+							if (command) {
+								const rewritten = rewriteCommandWithRtk(command, rtkBinary)
+								if (rewritten !== command) {
+									output.args = { ...(output.args ?? {}), command: rewritten }
+								}
+							}
+						}
 					}
-				}
-			: undefined,
+				: undefined,
 
 		'tool.execute.after': async (hookInput, toolOutput) => {
 			if (config.enableHooks) {
@@ -291,6 +347,21 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 
 		'experimental.chat.system.transform': async (_input, output) => {
 			const sessionID = _input.sessionID
+			if (config.enableCavemanOutputCompression) {
+				output.system.push(buildCavemanSystemPrompt(config.cavemanMode ?? 'full'))
+			}
+
+			const hookContext = sessionID
+				? [
+						...(persistentHookContextBySession.get(sessionID) ?? []),
+						...(promptHookContextBySession.get(sessionID) ?? []),
+					]
+				: []
+			if (sessionID && hookContext.length > 0) {
+				output.system.push(`# OpenHarness Hook Context\n\n${hookContext.join('\n\n')}`)
+				promptHookContextBySession.delete(sessionID)
+			}
+
 			const extraContexts = discoverExtraContext(cwd, {
 				issue: config.enableIssueContext !== false,
 				prComments: config.enablePrCommentsContext !== false,
@@ -321,8 +392,41 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			output.system.push(`# OpenHarness Compatibility Context\n\n${section}`)
 		},
 
+		'experimental.chat.messages.transform': async (_input, output) => {
+			if (!config.enableCavemanInputCompression) return
+
+			for (const message of output.messages) {
+				if (message.info.role !== 'user') continue
+				for (const part of message.parts) {
+					if (part.type === 'text') {
+						part.text = compressForCaveman(part.text, config.cavemanMode)
+					}
+					if (part.type === 'subtask') {
+						part.prompt = compressForCaveman(part.prompt, config.cavemanMode)
+					}
+				}
+			}
+		},
+
+		'experimental.text.complete': async (_input, output) => {
+			if (!config.enableCavemanOutputCompression) return
+			output.text = compressForCaveman(output.text, config.cavemanMode)
+		},
+
 		'chat.message': async (hookInput, output) => {
 			const prompt = extractUserPrompt(output.parts)
+			if (config.enableHooks) {
+				const { results } = await runMatchingHooks(
+					'chat.message',
+					{
+						prompt,
+						session_id: hookInput.sessionID,
+						message_id: hookInput.messageID,
+					},
+					prompt,
+				)
+				setHookContext(promptHookContextBySession, hookInput.sessionID, collectHookContext(results))
+			}
 			if (prompt) {
 				setLastPrompt(hookInput.sessionID, prompt)
 			} else if (hookInput.messageID) {
@@ -336,10 +440,12 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 
 			if (config.enableHooks) {
 				if (type === 'session.created' && sessionId) {
-					await runMatchingHooks('session.created', { session_id: sessionId })
+					const { results } = await runMatchingHooks('session.created', { session_id: sessionId })
+					rememberHookContext(sessionId, collectHookContext(results))
 				}
 				if (type === 'session.compacted' && sessionId) {
-					await runMatchingHooks('session.compacted', { session_id: sessionId })
+					const { results } = await runMatchingHooks('session.compacted', { session_id: sessionId })
+					rememberHookContext(sessionId, collectHookContext(results))
 				}
 				if (type === 'session.deleted' && sessionId) {
 					await runMatchingHooks('session.deleted', { session_id: sessionId })
@@ -403,6 +509,57 @@ function extractUserPrompt(parts: Array<Record<string, unknown>>): string {
 	return text
 }
 
+function collectHookContext(results: Array<{ kind: CompatHook['kind']; success: boolean; output: string }>): string[] {
+	const context: string[] = []
+	for (const result of results) {
+		if (!result.success) continue
+		for (const entry of extractHookContext(result.output)) {
+			if (!context.includes(entry)) context.push(entry)
+		}
+	}
+	return context
+}
+
+function extractHookContext(output: string): string[] {
+	const trimmed = output.trim()
+	if (!trimmed) return []
+
+	const parsed = tryParseJson(trimmed)
+	const structured = collectStructuredHookContext(parsed)
+	if (structured.length > 0) return structured
+
+	return [trimmed]
+}
+
+function collectStructuredHookContext(parsed: unknown): string[] {
+	if (!parsed || typeof parsed !== 'object') return []
+	const record = parsed as Record<string, unknown>
+	const context: string[] = []
+	const hookSpecific =
+		typeof record.hookSpecificOutput === 'object' && record.hookSpecificOutput != null
+			? (record.hookSpecificOutput as Record<string, unknown>)
+			: null
+
+	const additionalContext =
+		(typeof hookSpecific?.additionalContext === 'string' && hookSpecific.additionalContext) ||
+		(typeof record.additionalContext === 'string' && record.additionalContext) ||
+		(typeof record.prompt === 'string' && record.prompt) ||
+		''
+
+	if (additionalContext.trim()) context.push(additionalContext.trim())
+
+	return context
+}
+
+function tryParseJson(input: string): unknown {
+	if (!/^[\[{]/.test(input)) return null
+	try {
+		return JSON.parse(input)
+	} catch {
+		return null
+	}
+}
+
 function maybeRecordVerificationState(
 	sessionState: SessionStateTracker,
 	hookInput: { tool: string; args: any },
@@ -431,4 +588,9 @@ function maybeSetNextStep(sessionState: SessionStateTracker, hookInput: { tool: 
 	if (hookInput.tool === 'openharness_skill') {
 		sessionState.setNextStep('Use the loaded compatibility skill while continuing the current task.')
 	}
+}
+
+function normalizeCavemanMode(raw: unknown): CavemanMode {
+	if (raw === 'lite' || raw === 'full' || raw === 'ultra') return raw
+	return 'full'
 }
