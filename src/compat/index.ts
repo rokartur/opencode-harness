@@ -1,0 +1,14 @@
+export {
+  discoverPluginRoots,
+  discoverPluginDirs,
+  loadPluginsFromDirs,
+  buildCompatibilityReport,
+} from "./discovery.js";
+export { parseManifest } from "./manifest.js";
+export { loadCommandsFromPlugin } from "./commands.js";
+export { loadAgentsFromPlugin } from "./agents.js";
+export { loadSkillsFromPlugin } from "./skills.js";
+export { loadMcpFromPlugin } from "./mcp.js";
+export { loadHooksFromPlugin } from "./hooks.js";
+export { injectIntoConfig } from "./config.js";
+export { formatReport } from "./diagnostics.js";
