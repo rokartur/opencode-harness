@@ -100,7 +100,7 @@ import {
 	CommentChecker,
 	getCodeStatsReport,
 } from './runtime/index.js'
-import { DelegateService } from './runtime/delegate.js'
+import { DelegateService, type DelegateSessionAdapter } from './runtime/delegate.js'
 import { CodeIntelService } from './runtime/code-intel.js'
 import type { DoctorProbeContext } from './runtime/index.js'
 import { classifyVerification, combineVerificationRecords, createVerificationRecord } from './runtime/verifier.js'
@@ -175,6 +175,121 @@ function hostGlobFastPath(cwd: string, pattern: string, maxResults: number = 500
 	} catch {
 		return null
 	}
+}
+
+function resolveDelegateSessionAdapter(client: any): DelegateSessionAdapter | null {
+	const sessionClient = client?.session ?? client?.v2?.session ?? null
+	if (!sessionClient || typeof sessionClient.create !== 'function') return null
+	const promptFn =
+		typeof sessionClient.promptAsync === 'function'
+			? sessionClient.promptAsync.bind(sessionClient)
+			: typeof sessionClient.prompt === 'function'
+				? sessionClient.prompt.bind(sessionClient)
+				: null
+	if (!promptFn) return null
+	return {
+		async createSession(input) {
+			const result = await sessionClient.create({
+				body: {
+					title: input.label,
+					...(input.parentSessionID ? { parentID: input.parentSessionID } : {}),
+				},
+				query: { directory: input.cwd },
+			})
+			const payload = unwrapDelegateClientResult(result)
+			const sessionID =
+				(typeof payload?.id === 'string' && payload.id) ||
+				(typeof payload?.sessionID === 'string' && payload.sessionID) ||
+				(typeof payload?.sessionId === 'string' && payload.sessionId) ||
+				''
+			if (!sessionID) throw new Error('session create returned no session id')
+			return { sessionID }
+		},
+		async promptSession(input) {
+			const result = await promptFn({
+				path: { id: input.sessionID },
+				body: {
+					agent: input.agent,
+					parts: [{ type: 'text', text: input.prompt }],
+					...(input.model ? { model: input.model } : {}),
+				},
+				query: { directory: input.cwd },
+			})
+			const payload = unwrapDelegateClientResult(result)
+			return {
+				taskID:
+					(typeof payload?.taskID === 'string' && payload.taskID) ||
+					(typeof payload?.taskId === 'string' && payload.taskId) ||
+					(typeof payload?.id === 'string' && payload.id) ||
+					undefined,
+				status: 'running',
+				output: extractDelegateClientText(payload),
+			}
+		},
+		async inspectSession(input) {
+			const inspectFn =
+				typeof sessionClient.get === 'function'
+					? sessionClient.get.bind(sessionClient)
+					: typeof sessionClient.status === 'function'
+						? sessionClient.status.bind(sessionClient)
+						: null
+			if (!inspectFn) return null
+			const result = await inspectFn({ path: { id: input.sessionID }, query: { directory: input.cwd } })
+			const payload = unwrapDelegateClientResult(result)
+			const status = normalizeDelegateClientStatus(payload?.status ?? payload?.state ?? payload?.type)
+			return {
+				status,
+				output: extractDelegateClientText(payload),
+				error: typeof payload?.error === 'string' ? payload.error : '',
+			}
+		},
+		async abortSession(input) {
+			if (typeof sessionClient.abort !== 'function') return
+			const direct = async () => sessionClient.abort({ sessionID: input.sessionID })
+			const legacy = async () =>
+				sessionClient.abort({ path: { id: input.sessionID }, query: { directory: input.cwd } })
+			try {
+				await direct()
+			} catch {
+				await legacy()
+			}
+		},
+	}
+}
+
+function unwrapDelegateClientResult(result: any): Record<string, any> {
+	if (result?.error) {
+		const detail = typeof result.error?.message === 'string' ? result.error.message : JSON.stringify(result.error)
+		throw new Error(detail)
+	}
+	if (result?.data && typeof result.data === 'object') return result.data as Record<string, any>
+	if (result && typeof result === 'object') return result as Record<string, any>
+	return {}
+}
+
+function extractDelegateClientText(payload: Record<string, any>): string {
+	if (typeof payload.output === 'string') return payload.output
+	if (typeof payload.text === 'string') return payload.text
+	if (typeof payload.summary === 'string') return payload.summary
+	if (Array.isArray(payload.parts)) {
+		return payload.parts
+			.filter((part: any) => part?.type === 'text' && typeof part.text === 'string')
+			.map((part: any) => part.text)
+			.join('\n')
+	}
+	return ''
+}
+
+function normalizeDelegateClientStatus(value: unknown): 'running' | 'done' | 'failed' | 'cancelled' | undefined {
+	if (typeof value !== 'string') return undefined
+	const normalized = value.toLowerCase().trim()
+	if (normalized === 'done' || normalized === 'completed' || normalized === 'complete' || normalized === 'idle') {
+		return 'done'
+	}
+	if (normalized === 'failed' || normalized === 'error') return 'failed'
+	if (normalized === 'cancelled' || normalized === 'canceled') return 'cancelled'
+	if (normalized === 'running' || normalized === 'pending' || normalized === 'queued') return 'running'
+	return undefined
 }
 
 export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
@@ -374,10 +489,12 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		enabled: config.enableSessionRecovery === true,
 	})
 	const qualityScorer = new QualityScorer({ enabled: config.enableQualityScorer === true })
+	const delegateSessionAdapter = resolveDelegateSessionAdapter(input.client as any)
 	const delegateService = new DelegateService({
 		enabled: config.enableDelegate === true,
 		dataDir: join(runtimeDataDir, 'delegate'),
-		workdir: cwd,
+		cwd,
+		sessionAdapter: delegateSessionAdapter,
 	})
 	const codeIntel = new CodeIntelService({
 		enabled: config.enableCodeIntel === true,
@@ -453,6 +570,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				rtkAvailable,
 				cavememAvailable,
 				rgAvailable,
+				astGrepAvailable: checkBinary('ast-grep') || checkBinary('sg'),
 				gitAvailable: checkBinary('git'),
 				bunAvailable: checkBinary('bun'),
 			},
@@ -506,6 +624,48 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		const summary = delegateService.renderSummary()
 		if (sessionID) getSessionRuntime(sessionID).setDelegateSummary(summary)
 		return summary
+	}
+
+	function renderDelegateJob(job: {
+		id: string
+		label: string
+		kind: string
+		mode: string
+		status: string
+		cwd: string
+		command: string
+		startedAt: number | null
+		completedAt: number | null
+		exitCode: number | null
+		output: string
+		error: string
+		sessionID?: string
+		taskID?: string
+		agent?: string
+		model?: string
+	}) {
+		const lines = [
+			`Job: ${job.id}`,
+			`Label: ${job.label}`,
+			`Kind: ${job.kind}`,
+			`Mode: ${job.mode}`,
+			`Status: ${job.status}`,
+			`CWD: ${toDisplayPath(cwd, job.cwd || cwd)}`,
+		]
+		if (job.mode === 'shell') {
+			lines.push(`Command: ${job.command}`)
+		} else {
+			if (job.agent) lines.push(`Agent: ${job.agent}`)
+			if (job.model) lines.push(`Model: ${job.model}`)
+			if (job.sessionID) lines.push(`Session: ${job.sessionID}`)
+			if (job.taskID) lines.push(`Task: ${job.taskID}`)
+		}
+		if (job.startedAt) lines.push(`Started: ${new Date(job.startedAt).toISOString()}`)
+		if (job.completedAt) lines.push(`Completed: ${new Date(job.completedAt).toISOString()}`)
+		if (job.exitCode !== null) lines.push(`Exit code: ${job.exitCode}`)
+		if (job.output) lines.push(`Output: ${job.output.slice(0, 2000)}`)
+		if (job.error) lines.push(`Error: ${job.error.slice(0, 1000)}`)
+		return lines.join('\n')
 	}
 
 	function buildGraphToolHints(input: {
@@ -686,6 +846,15 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		}
 		if (tool === 'openharness_patch') {
 			pushPath(args.file)
+		}
+		if (tool === 'openharness_graph_query' || tool === 'openharness_graph_symbols') {
+			pushPath(args.file)
+		}
+		if (tool === 'openharness_intel_outline') {
+			pushPath(args.file)
+		}
+		if (tool === 'openharness_intel_ast_search') {
+			pushPath(args.path)
 		}
 		if (tool === 'openharness_cavekit_spec' || tool === 'openharness_cavekit_backprop') {
 			artifacts.add(toDisplayPath(cwd, resolveCaveKitSpecPath(cwd)))
@@ -1239,6 +1408,163 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					return 'Unknown action'
 				},
 			}),
+			openharness_graph_symbols: toolFn({
+				description:
+					'Query symbol-level graph-lite information: find/search, signature lookup, callers/callees, references, blast radius, and approximate call cycles.',
+				args: {
+					action: z.enum([
+						'find',
+						'search',
+						'signature',
+						'callers',
+						'callees',
+						'references',
+						'blast_radius',
+						'call_cycles',
+					]),
+					name: z.string().optional().describe('Symbol name or search query'),
+					file: z
+						.string()
+						.optional()
+						.describe('Optional repo-local file path to scope or disambiguate results'),
+					kind: z.string().optional().describe('Optional symbol kind filter'),
+					limit: z.number().optional().describe('Optional result limit'),
+				},
+				async execute(args) {
+					const status = graphLite.getStatus()
+					if (!status.ready) return 'Graph-lite not ready. Run openharness_graph_status action="scan" first.'
+					const limit = args.limit ?? 20
+					const scopeMatches = (query: string) =>
+						graphLite
+							.searchSymbols(query, Math.max(limit, 10))
+							.filter(match => !args.kind || match.symbol.kind === args.kind)
+							.filter(
+								match =>
+									!args.file ||
+									match.filePath === args.file ||
+									match.filePath.endsWith(args.file.replace(/^\.\//, '')),
+							)
+					if (args.action === 'call_cycles') {
+						const cycles = graphLite.getCallGraphCycles(limit)
+						if (cycles.length === 0) return 'No approximate call cycles found.'
+						return cycles
+							.map(
+								(cycle, index) =>
+									`- Cycle ${index + 1}: ${cycle.cycle.map(entry => `${entry.name}@${entry.path}:${entry.line}`).join(' -> ')}`,
+							)
+							.join('\n')
+					}
+					if (!args.name) return 'name parameter required'
+					if (args.action === 'find' || args.action === 'search') {
+						const matches = scopeMatches(args.name).slice(0, limit)
+						if (matches.length === 0) return `No symbols found matching '${args.name}'`
+						return matches
+							.map(
+								match =>
+									`- ${match.symbol.name} (${match.symbol.kind}) [${match.filePath}:${match.symbol.line}]${match.symbol.isExported ? ' [exported]' : ''}`,
+							)
+							.join('\n')
+					}
+					if (args.action === 'references') {
+						const refs = graphLite.getSymbolReferences(args.name, limit)
+						if (refs.length === 0) return `No references found for '${args.name}'.`
+						return refs
+							.map(
+								ref =>
+									`- ${ref.filePath}:${ref.line} ${ref.context || `[${ref.kind}] ${ref.symbolName}`}`,
+							)
+							.join('\n')
+					}
+					if (args.action === 'blast_radius') {
+						const blast = graphLite.getSymbolBlastRadius(args.name, 5)
+						if (blast.totalAffected === 0) return `No transitive callers found for '${args.name}'.`
+						return [
+							`Root: ${blast.root.name} @ ${blast.root.path}:${blast.root.line}`,
+							`Affected: ${blast.totalAffected}`,
+							...blast.affected
+								.slice(0, limit)
+								.map(entry => `- ${entry.name} @ ${entry.path}:${entry.line} (depth ${entry.depth})`),
+						].join('\n')
+					}
+					const matches = scopeMatches(args.name)
+					const selected = matches[0]
+					if (!selected) return `No symbols found matching '${args.name}'`
+					if (args.action === 'signature') {
+						const signature = graphLite.getSymbolSignature(selected.filePath, selected.symbol.name)
+						if (!signature) return `No signature found for '${args.name}'.`
+						return [
+							`File: ${signature.filePath}:${signature.line}`,
+							'```ts',
+							signature.signature,
+							'```',
+						].join('\n')
+					}
+					if (args.action === 'callers') {
+						const callers = graphLite.getCallers(selected.filePath, selected.symbol.name)
+						if (callers.length === 0) return `No callers found for '${selected.symbol.name}'.`
+						return callers
+							.slice(0, limit)
+							.map(caller => `- ${caller.filePath} imports ${caller.symbolName}`)
+							.join('\n')
+					}
+					const calleeFile = args.file ?? selected.filePath
+					const callees = graphLite.getCallees(calleeFile)
+					if (callees.length === 0) return `No callees found for '${calleeFile}'.`
+					return callees
+						.slice(0, limit)
+						.map(callee => `- ${callee.symbolName} from ${callee.sourcePath}`)
+						.join('\n')
+				},
+			}),
+			openharness_graph_analyze: toolFn({
+				description:
+					'Run lightweight graph-lite analysis for unused exports, duplication, near-duplicates, and circular dependencies.',
+				args: {
+					action: z.enum(['unused_exports', 'duplication', 'near_duplicates', 'circular_deps']),
+					limit: z.number().optional().describe('Optional result limit'),
+					threshold: z
+						.number()
+						.optional()
+						.describe('Optional near-duplicate similarity threshold (default 0.85)'),
+				},
+				async execute(args) {
+					const status = graphLite.getStatus()
+					if (!status.ready) return 'Graph-lite not ready. Run openharness_graph_status action="scan" first.'
+					const limit = args.limit ?? 20
+					if (args.action === 'unused_exports') {
+						const unused = graphLite.getUnusedExports(limit)
+						if (unused.length === 0) return 'No approximate unused exports found.'
+						return unused
+							.map(entry => `- ${entry.symbolName} (${entry.kind}) at ${entry.filePath}:${entry.line}`)
+							.join('\n')
+					}
+					if (args.action === 'duplication') {
+						const blocks = graphLite.getDuplicateBlocks(limit)
+						if (blocks.length === 0) return 'No duplicate code blocks found.'
+						return blocks
+							.map(block => {
+								const hits = block.occurrences
+									.map(hit => `${hit.filePath}:${hit.startLine}-${hit.endLine}`)
+									.join(', ')
+								return `- ${hits} :: ${block.snippet.replace(/\s+/g, ' ').slice(0, 160)}`
+							})
+							.join('\n')
+					}
+					if (args.action === 'near_duplicates') {
+						const pairs = graphLite.getNearDuplicateFiles(limit, args.threshold ?? 0.85)
+						if (pairs.length === 0) return 'No near-duplicate files found.'
+						return pairs
+							.map(
+								pair =>
+									`- ${pair.leftPath} <-> ${pair.rightPath} (${(pair.similarity * 100).toFixed(1)}%)`,
+							)
+							.join('\n')
+					}
+					const cycles = graphLite.getCircularDependencyCycles(limit)
+					if (cycles.length === 0) return 'No circular dependencies found.'
+					return cycles.map(cycle => `- ${cycle.join(' -> ')} -> ${cycle[0]}`).join('\n')
+				},
+			}),
 			openharness_fs_undo: toolFn({
 				description: 'Restore the latest snapshot captured for a harness-owned file mutation.',
 				args: {
@@ -1767,22 +2093,43 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			}),
 			openharness_delegate_start: toolFn({
 				description:
-					'Start a bounded background delegate job (index, review, research) with explicit status/audit visibility.',
+					'Start a bounded background delegate job. Supports repo-scoped shell execution and optional child-session delegation when host session APIs are available.',
 				args: {
 					label: z.string().describe('Human-readable label for the job'),
 					kind: z.enum(['index', 'review', 'research', 'custom']).describe('Job category'),
-					command: z.string().describe('Shell command to execute'),
+					mode: z
+						.enum(['shell', 'session'])
+						.optional()
+						.describe('Delegate transport. Defaults to shell unless agent/prompt is provided.'),
+					command: z.string().optional().describe('Shell command to execute for shell mode'),
+					agent: z.string().optional().describe('Agent to use for session mode'),
+					prompt: z.string().optional().describe('Instruction or question for session mode'),
+					context: z.string().optional().describe('Optional extra context prepended to the session prompt'),
+					model: z.string().optional().describe('Optional model override for session mode'),
 				},
 				async execute(args, ctx) {
-					const job = delegateService.start(args.label, args.kind, args.command)
+					const mode = args.mode ?? (args.agent && args.prompt ? 'session' : 'shell')
+					if (mode === 'session' && (!args.agent || !args.prompt)) {
+						return 'Session delegate requires both agent and prompt.'
+					}
+					if (mode === 'shell' && !args.command) {
+						return 'Shell delegate requires command.'
+					}
+					const job =
+						mode === 'session'
+							? await delegateService.startSession({
+									label: args.label,
+									kind: args.kind,
+									agent: args.agent ?? '',
+									prompt: args.prompt ?? '',
+									context: args.context,
+									model: args.model,
+									cwd: ctx.directory,
+									parentSessionID: ctx.sessionID,
+								})
+							: delegateService.start(args.label, args.kind, args.command ?? '', ctx.directory)
 					refreshDelegateSummary(ctx.sessionID)
-					return [
-						`Job: ${job.id}`,
-						`Label: ${job.label}`,
-						`Kind: ${job.kind}`,
-						`Status: ${job.status}`,
-						job.error ? `Error: ${job.error}` : 'Queued for execution.',
-					].join('\n')
+					return renderDelegateJob(job)
 				},
 			}),
 			openharness_delegate_status: toolFn({
@@ -1791,22 +2138,36 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					id: z.string().describe('Job ID returned by openharness_delegate_start'),
 				},
 				async execute(args, ctx) {
-					const job = delegateService.getStatus(args.id)
+					const job = await delegateService.refresh(args.id)
 					refreshDelegateSummary(ctx.sessionID)
 					if (!job) return `Job '${args.id}' not found.`
-					const lines = [
-						`Job: ${job.id}`,
-						`Label: ${job.label}`,
-						`Kind: ${job.kind}`,
-						`Status: ${job.status}`,
-						`Command: ${job.command}`,
-					]
-					if (job.startedAt) lines.push(`Started: ${new Date(job.startedAt).toISOString()}`)
-					if (job.completedAt) lines.push(`Completed: ${new Date(job.completedAt).toISOString()}`)
-					if (job.exitCode !== null) lines.push(`Exit code: ${job.exitCode}`)
-					if (job.output) lines.push(`Output: ${job.output.slice(0, 2000)}`)
-					if (job.error) lines.push(`Error: ${job.error.slice(0, 1000)}`)
-					return lines.join('\n')
+					return renderDelegateJob(job)
+				},
+			}),
+			openharness_delegate_continue: toolFn({
+				description: 'Send a follow-up prompt to a running session-backed delegate job.',
+				args: {
+					id: z.string().describe('Session-backed delegate job id'),
+					prompt: z.string().describe('Follow-up prompt to send'),
+					context: z.string().optional().describe('Optional extra context prepended to the follow-up prompt'),
+				},
+				async execute(args, ctx) {
+					const job = await delegateService.continue(args.id, args.prompt, args.context)
+					refreshDelegateSummary(ctx.sessionID)
+					if (!job) return `Job '${args.id}' not found or does not support session continuation.`
+					return renderDelegateJob(job)
+				},
+			}),
+			openharness_delegate_cancel: toolFn({
+				description: 'Cancel a delegate job and terminate active shell work when possible.',
+				args: {
+					id: z.string().describe('Delegate job id'),
+				},
+				async execute(args, ctx) {
+					const job = await delegateService.cancel(args.id)
+					refreshDelegateSummary(ctx.sessionID)
+					if (!job) return `Job '${args.id}' not found.`
+					return renderDelegateJob(job)
 				},
 			}),
 			openharness_delegate_list: toolFn({
@@ -1819,11 +2180,16 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				},
 				async execute(args, ctx) {
 					const jobs = delegateService.list(args.status as any)
+					await Promise.all(
+						jobs.filter(job => job.mode === 'session').map(job => delegateService.refresh(job.id)),
+					)
+					const refreshed = delegateService.list(args.status as any)
 					refreshDelegateSummary(ctx.sessionID)
-					if (jobs.length === 0) return args.status ? `No ${args.status} delegate jobs.` : 'No delegate jobs.'
-					return jobs
+					if (refreshed.length === 0)
+						return args.status ? `No ${args.status} delegate jobs.` : 'No delegate jobs.'
+					return refreshed
 						.slice(-20)
-						.map(j => `- ${j.id} [${j.status}] ${j.label} (${j.kind})`)
+						.map(j => `- ${j.id} [${j.status}/${j.mode}] ${j.label} (${j.kind})`)
 						.join('\n')
 				},
 			}),
@@ -1831,6 +2197,12 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				description: 'Show delegate audit trail with recent bounded background jobs.',
 				args: {},
 				async execute(_args, ctx) {
+					await Promise.all(
+						delegateService
+							.list()
+							.filter(job => job.mode === 'session')
+							.map(job => delegateService.refresh(job.id)),
+					)
 					refreshDelegateSummary(ctx.sessionID)
 					return delegateService.renderAudit()
 				},
@@ -1876,6 +2248,35 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					const refs = codeIntel.findReferences(args.symbol, args.include, args.limit ?? 50)
 					if (refs.length === 0) return `No references found for '${args.symbol}'. Requires rg.`
 					return refs.map(r => `- ${r.filePath}:${r.line}:${r.column} ${r.text}`).join('\n')
+				},
+			}),
+			openharness_intel_ast_search: toolFn({
+				description:
+					'Run read-only AST search via ast-grep/sg when available. Returns structural matches with file and range info.',
+				args: {
+					pattern: z.string().describe('ast-grep pattern to search for'),
+					path: z.string().optional().describe('Optional repo-local file or subdirectory scope'),
+					lang: z.string().optional().describe('Optional ast-grep language override, e.g. ts or js'),
+					limit: z.number().optional().describe('Max results (default 50)'),
+				},
+				async execute(args, ctx) {
+					const targetPath = args.path
+						? toDisplayPath(ctx.directory, resolveRepoLocalPath(ctx.directory, args.path))
+						: '.'
+					const results = codeIntel.astSearch(args.pattern, {
+						path: args.path,
+						lang: args.lang,
+						limit: args.limit ?? 50,
+					})
+					if (results === null)
+						return 'AST search unavailable. Install `ast-grep` or `sg` and enable code intel.'
+					if (results.length === 0) return `No AST matches found for pattern in ${targetPath}.`
+					return results
+						.map(
+							match =>
+								`- ${match.filePath}:${match.startLine}:${match.startColumn}-${match.endLine}:${match.endColumn} ${match.text.replace(/\s+/g, ' ').trim()}`,
+						)
+						.join('\n')
 				},
 			}),
 			openharness_code_stats: toolFn({

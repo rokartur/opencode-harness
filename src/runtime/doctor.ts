@@ -47,6 +47,7 @@ export interface DoctorProbeContext {
 		rtkAvailable: boolean
 		cavememAvailable: boolean
 		rgAvailable: boolean
+		astGrepAvailable: boolean
 		gitAvailable: boolean
 		bunAvailable: boolean
 	}
@@ -347,13 +348,30 @@ function probeDelegateConsistency(ctx: DoctorProbeContext): DoctorCheckResult {
 function probeCodeIntelConsistency(ctx: DoctorProbeContext): DoctorCheckResult {
 	if (!ctx.config.enableCodeIntel)
 		return { id: 'code-intel', status: 'OK', message: 'Code intel disabled (not required)' }
-	if (ctx.binaries.rgAvailable)
-		return { id: 'code-intel', status: 'OK', message: 'Code intel enabled with rg support' }
+	if (ctx.binaries.rgAvailable && ctx.binaries.astGrepAvailable) {
+		return { id: 'code-intel', status: 'OK', message: 'Code intel enabled with rg + ast-grep support' }
+	}
+	if (ctx.binaries.rgAvailable) {
+		return {
+			id: 'code-intel',
+			status: 'WARN',
+			message: 'Code intel enabled with rg support only',
+			detail: 'Reference search works; install ast-grep or sg for read-only AST search',
+		}
+	}
+	if (ctx.binaries.astGrepAvailable) {
+		return {
+			id: 'code-intel',
+			status: 'WARN',
+			message: 'Code intel enabled with ast-grep support only',
+			detail: 'AST search works; install rg for reference search',
+		}
+	}
 	return {
 		id: 'code-intel',
 		status: 'WARN',
-		message: 'Code intel enabled but rg unavailable',
-		detail: 'Reference search will be unavailable; outline and definition lookup still work via graph-lite',
+		message: 'Code intel enabled but rg and ast-grep are unavailable',
+		detail: 'Reference search and AST search will be unavailable; outline and definition lookup still work via graph-lite',
 	}
 }
 

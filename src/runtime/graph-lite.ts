@@ -14,6 +14,53 @@ export interface GraphLiteSymbol {
 export interface GraphLiteSymbolRef {
 	symbolName: string
 	sourcePath: string
+	line: number
+	importedAs?: string
+}
+
+export interface GraphLiteSymbolSignature {
+	symbolName: string
+	filePath: string
+	line: number
+	kind: string
+	signature: string
+}
+
+export interface GraphLiteSymbolReference {
+	symbolName: string
+	filePath: string
+	line: number
+	kind: 'import'
+	context: string
+}
+
+export interface GraphLiteSymbolBlastRadius {
+	root: { name: string; path: string; line: number }
+	totalAffected: number
+	affected: Array<{ name: string; path: string; line: number; depth: number }>
+}
+
+export interface GraphLiteCallCycle {
+	cycle: Array<{ name: string; path: string; line: number }>
+}
+
+export interface GraphLiteUnusedExport {
+	symbolName: string
+	filePath: string
+	line: number
+	kind: string
+}
+
+export interface GraphLiteDuplicateBlock {
+	hash: string
+	snippet: string
+	occurrences: Array<{ filePath: string; startLine: number; endLine: number }>
+}
+
+export interface GraphLiteNearDuplicate {
+	leftPath: string
+	rightPath: string
+	similarity: number
 }
 
 export interface GraphLiteBlastRadiusDetail {
@@ -246,6 +293,226 @@ export class GraphLiteService {
 		return this.findFile(filePath)?.symbolRefs ?? []
 	}
 
+	getSymbolSignature(filePath: string, symbolName: string): GraphLiteSymbolSignature | null {
+		const file = this.findFile(filePath)
+		if (!file) return null
+		const symbol =
+			file.symbols.find(entry => entry.name.toLowerCase() === symbolName.toLowerCase()) ??
+			file.symbols.find(entry => entry.name === symbolName)
+		if (!symbol) return null
+		const content = readFileText(resolve(this.cwd, file.path))
+		if (!content) return null
+		const lines = content.split('\n')
+		return {
+			symbolName: symbol.name,
+			filePath: file.path,
+			line: symbol.line,
+			kind: symbol.kind,
+			signature: extractSignature(lines, symbol.line),
+		}
+	}
+
+	getSymbolReferences(symbolName: string, limit: number = 20): GraphLiteSymbolReference[] {
+		if (!this.index) return []
+		const needle = symbolName.toLowerCase().trim()
+		if (!needle) return []
+		const results: GraphLiteSymbolReference[] = []
+		for (const file of this.index.files) {
+			const content = readFileText(resolve(this.cwd, file.path))
+			const lines = content ? content.split('\n') : []
+			for (const ref of file.symbolRefs) {
+				if (ref.symbolName.toLowerCase() !== needle) continue
+				const line = Number.isFinite(ref.line) ? ref.line : 0
+				results.push({
+					symbolName: ref.symbolName,
+					filePath: file.path,
+					line,
+					kind: 'import',
+					context: line > 0 ? (lines[line - 1] ?? '').trim() : '',
+				})
+				if (results.length >= limit) return results
+			}
+		}
+		return results
+	}
+
+	getSymbolBlastRadius(symbolName: string, maxDepth: number = 5): GraphLiteSymbolBlastRadius {
+		const root = this.resolvePrimarySymbol(symbolName)
+		if (!root) {
+			return {
+				root: { name: symbolName, path: '', line: 0 },
+				totalAffected: 0,
+				affected: [],
+			}
+		}
+		const affected: Array<{ name: string; path: string; line: number; depth: number }> = []
+		const queue: Array<{ filePath: string; symbolName: string; depth: number }> = [
+			{ filePath: root.filePath, symbolName: root.symbol.name, depth: 0 },
+		]
+		const seen = new Set<string>([`${root.filePath}::${root.symbol.name.toLowerCase()}`])
+		while (queue.length > 0) {
+			const current = queue.shift()!
+			if (current.depth >= maxDepth) continue
+			const callers = this.getCallers(current.filePath, current.symbolName)
+			for (const caller of callers) {
+				const callerFile = this.findFile(caller.filePath)
+				if (!callerFile) continue
+				const propagated = callerFile.symbols.filter(symbol => symbol.isExported)
+				const symbols = propagated.length > 0 ? propagated : callerFile.symbols.slice(0, 1)
+				for (const symbol of symbols) {
+					const key = `${callerFile.path}::${symbol.name.toLowerCase()}`
+					if (seen.has(key)) continue
+					seen.add(key)
+					affected.push({
+						name: symbol.name,
+						path: callerFile.path,
+						line: symbol.line,
+						depth: current.depth + 1,
+					})
+					queue.push({ filePath: callerFile.path, symbolName: symbol.name, depth: current.depth + 1 })
+				}
+			}
+		}
+		affected.sort((left, right) => left.depth - right.depth || left.path.localeCompare(right.path))
+		return {
+			root: { name: root.symbol.name, path: root.filePath, line: root.symbol.line },
+			totalAffected: affected.length,
+			affected,
+		}
+	}
+
+	getCallGraphCycles(limit: number = 10): GraphLiteCallCycle[] {
+		return this.getCircularDependencyCycles(limit).map(cycle => ({
+			cycle: cycle.map(path => {
+				const file = this.findFile(path)
+				const symbol = file?.symbols.find(entry => entry.isExported) ?? file?.symbols[0]
+				return {
+					name: symbol?.name ?? fallbackSymbolName(path),
+					path,
+					line: symbol?.line ?? 1,
+				}
+			}),
+		}))
+	}
+
+	getCircularDependencyCycles(limit: number = 10): string[][] {
+		if (!this.index) return []
+		const cycles: string[][] = []
+		const seen = new Set<string>()
+		const visit = (path: string, stack: string[], active: Set<string>) => {
+			const cycleStart = stack.indexOf(path)
+			if (cycleStart >= 0) {
+				const cycle = stack.slice(cycleStart)
+				if (cycle.length >= 2) {
+					const key = canonicalizeCycle(cycle)
+					if (!seen.has(key)) {
+						seen.add(key)
+						cycles.push(cycle)
+					}
+				}
+				return
+			}
+			if (active.has(path)) return
+			active.add(path)
+			stack.push(path)
+			for (const dep of this.getFileDependencies(path)) {
+				visit(dep, stack, active)
+				if (cycles.length >= limit) break
+			}
+			stack.pop()
+			active.delete(path)
+		}
+		for (const file of this.index.files) {
+			visit(file.path, [], new Set())
+			if (cycles.length >= limit) break
+		}
+		return cycles.slice(0, limit)
+	}
+
+	getUnusedExports(limit: number = 20): GraphLiteUnusedExport[] {
+		if (!this.index) return []
+		const imported = new Set<string>()
+		for (const file of this.index.files) {
+			for (const ref of file.symbolRefs) {
+				imported.add(`${ref.sourcePath}::${ref.symbolName.toLowerCase()}`)
+			}
+		}
+		const results: GraphLiteUnusedExport[] = []
+		for (const file of this.index.files) {
+			for (const symbol of file.symbols) {
+				if (!symbol.isExported) continue
+				if (imported.has(`${file.path}::${symbol.name.toLowerCase()}`)) continue
+				results.push({ symbolName: symbol.name, filePath: file.path, line: symbol.line, kind: symbol.kind })
+			}
+		}
+		return results.slice(0, limit)
+	}
+
+	getDuplicateBlocks(limit: number = 10, windowSize: number = 3): GraphLiteDuplicateBlock[] {
+		if (!this.index) return []
+		const occurrences = new Map<
+			string,
+			Array<{ filePath: string; startLine: number; endLine: number; snippet: string }>
+		>()
+		for (const file of this.index.files) {
+			const content = readFileText(resolve(this.cwd, file.path))
+			if (!content) continue
+			const lines = content.split('\n')
+			for (let index = 0; index <= lines.length - windowSize; index++) {
+				const slice = lines.slice(index, index + windowSize)
+				const normalized = slice.map(normalizeDuplicateLine)
+				if (!isMeaningfulDuplicateWindow(normalized)) continue
+				const key = normalized.join('\n')
+				const next = occurrences.get(key) ?? []
+				next.push({
+					filePath: file.path,
+					startLine: index + 1,
+					endLine: index + windowSize,
+					snippet: slice.join('\n').trim(),
+				})
+				occurrences.set(key, next)
+			}
+		}
+		return Array.from(occurrences.entries())
+			.filter(([, hits]) => hits.length > 1)
+			.sort((left, right) => right[1].length - left[1].length || left[0].localeCompare(right[0]))
+			.slice(0, limit)
+			.map(([hash, hits]) => ({
+				hash,
+				snippet: hits[0]?.snippet ?? '',
+				occurrences: hits.map(hit => ({
+					filePath: hit.filePath,
+					startLine: hit.startLine,
+					endLine: hit.endLine,
+				})),
+			}))
+	}
+
+	getNearDuplicateFiles(limit: number = 10, threshold: number = 0.85): GraphLiteNearDuplicate[] {
+		if (!this.index) return []
+		const samples = this.index.files.slice(0, 250).map(file => ({
+			path: file.path,
+			lines: file.lineCount,
+			fingerprint: buildNearDuplicateFingerprint(readFileText(resolve(this.cwd, file.path)) ?? ''),
+		}))
+		const results: GraphLiteNearDuplicate[] = []
+		for (let left = 0; left < samples.length; left++) {
+			for (let right = left + 1; right < samples.length; right++) {
+				const a = samples[left]
+				const b = samples[right]
+				if (!a || !b || a.fingerprint.size === 0 || b.fingerprint.size === 0) continue
+				const maxLines = Math.max(a.lines, b.lines)
+				if (maxLines > 0 && Math.abs(a.lines - b.lines) / maxLines > 0.4) continue
+				const similarity = computeSetSimilarity(a.fingerprint, b.fingerprint)
+				if (similarity < threshold) continue
+				results.push({ leftPath: a.path, rightPath: b.path, similarity })
+			}
+		}
+		return results
+			.sort((left, right) => right.similarity - left.similarity || left.leftPath.localeCompare(right.leftPath))
+			.slice(0, limit)
+	}
+
 	getCoChangeHints(path: string, limit: number = 10): GraphLiteCoChangeHint[] {
 		const target = this.findFile(path)
 		if (!target || !this.index) return []
@@ -293,6 +560,16 @@ export class GraphLiteService {
 		return (
 			(this.index?.files ?? []).find(file => file.path === normalized || file.path.endsWith(normalized)) ?? null
 		)
+	}
+
+	private resolvePrimarySymbol(symbolName: string): { filePath: string; symbol: GraphLiteSymbol } | null {
+		const needle = symbolName.toLowerCase().trim()
+		if (!needle) return null
+		const exact = this.searchSymbols(symbolName, 20).find(
+			result => result.symbol.name.toLowerCase() === needle && result.symbol.isExported,
+		)
+		if (exact) return exact
+		return this.searchSymbols(symbolName, 1)[0] ?? null
 	}
 
 	private loadFromDisk(): void {
@@ -442,20 +719,87 @@ function extractSymbolRefs(content: string, absPath: string, cwd: string): Graph
 	const refs: GraphLiteSymbolRef[] = []
 	const pattern = /import\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]/g
 	for (const match of content.matchAll(pattern)) {
+		const start = match.index ?? 0
+		const line = content.slice(0, start).split('\n').length
 		const names = match[1]?.trim()
 		const specifier = match[2]?.trim()
 		if (!names || !specifier || !specifier.startsWith('.')) continue
 		const resolved = resolveImportSpecifier(absPath, specifier, cwd)
 		if (!resolved) continue
 		for (const name of names.split(',')) {
-			const clean = name
-				.trim()
-				.replace(/\s+as\s+\w+$/, '')
-				.trim()
-			if (clean) refs.push({ symbolName: clean, sourcePath: resolved })
+			const trimmed = name.trim()
+			const aliasMatch = trimmed.match(/^([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/)
+			const clean = aliasMatch?.[1]?.trim() ?? trimmed.replace(/\s+as\s+\w+$/, '').trim()
+			const importedAs = aliasMatch?.[2]?.trim()
+			if (clean) refs.push({ symbolName: clean, sourcePath: resolved, line, importedAs })
 		}
 	}
 	return refs
+}
+
+function extractSignature(lines: string[], lineNumber: number): string {
+	const start = Math.max(0, lineNumber - 1)
+	const collected: string[] = []
+	for (let index = start; index < Math.min(lines.length, start + 4); index++) {
+		const trimmed = lines[index]?.trim() ?? ''
+		if (!trimmed) {
+			if (collected.length > 0) break
+			continue
+		}
+		collected.push(trimmed)
+		if (/[{;]$/.test(trimmed) || /=>/.test(trimmed) || /\)\s*\{?$/.test(trimmed)) break
+	}
+	return collected.join(' ').replace(/\s+/g, ' ').trim()
+}
+
+function fallbackSymbolName(path: string): string {
+	const normalized = normalizeQueryPath(path)
+	const parts = normalized.split('/')
+	return parts[parts.length - 1]?.replace(/\.[^.]+$/, '') || normalized
+}
+
+function canonicalizeCycle(cycle: string[]): string {
+	const variants: string[] = []
+	for (let index = 0; index < cycle.length; index++) {
+		const rotated = cycle.slice(index).concat(cycle.slice(0, index))
+		variants.push(rotated.join('>'))
+		variants.push(rotated.slice().reverse().join('>'))
+	}
+	return variants.sort()[0] ?? cycle.join('>')
+}
+
+function normalizeDuplicateLine(line: string): string {
+	return line
+		.trim()
+		.replace(/\s+/g, ' ')
+		.replace(/\b(function|class|interface|type|enum|const|let)\s+[A-Za-z_$][\w$]*/g, '$1 $__IDENT')
+}
+
+function isMeaningfulDuplicateWindow(lines: string[]): boolean {
+	if (lines.length === 0) return false
+	const joined = lines.join('\n').trim()
+	if (joined.length < 40) return false
+	return lines.filter(line => /[A-Za-z0-9_$]/.test(line)).length >= Math.min(2, lines.length)
+}
+
+function buildNearDuplicateFingerprint(content: string): Set<string> {
+	return new Set(
+		content
+			.split('\n')
+			.map(normalizeDuplicateLine)
+			.filter(line => line.length >= 8)
+			.filter(line => !line.startsWith('import ') && !line.startsWith('export {')),
+	)
+}
+
+function computeSetSimilarity(left: Set<string>, right: Set<string>): number {
+	if (left.size === 0 || right.size === 0) return 0
+	let shared = 0
+	for (const value of left) {
+		if (right.has(value)) shared++
+	}
+	const denominator = Math.max(left.size, right.size)
+	return denominator === 0 ? 0 : shared / denominator
 }
 
 function normalizeQueryPath(path: string): string {

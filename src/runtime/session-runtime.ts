@@ -126,7 +126,13 @@ export class SessionRuntimeTracker {
 	}
 
 	noteTool(tool: string, args: unknown): void {
-		if (tool === 'read' || tool === 'glob') {
+		if (
+			tool === 'read' ||
+			tool === 'glob' ||
+			tool === 'grep' ||
+			tool.startsWith('openharness_graph_') ||
+			tool.startsWith('openharness_intel_')
+		) {
 			this.phase = 'load-context'
 		} else if (tool === 'bash') {
 			const rawCommand = (args as { command?: unknown })?.command

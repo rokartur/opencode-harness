@@ -44,8 +44,15 @@ export {
 	type GraphLiteSymbol,
 	type GraphLiteSymbolRef,
 	type GraphLiteBlastRadiusDetail,
+	type GraphLiteCallCycle,
 	type GraphLiteCoChangeHint,
+	type GraphLiteDuplicateBlock,
+	type GraphLiteNearDuplicate,
 	type GraphLitePackageGroup,
+	type GraphLiteSymbolBlastRadius,
+	type GraphLiteSymbolReference,
+	type GraphLiteSymbolSignature,
+	type GraphLiteUnusedExport,
 } from './graph-lite.js'
 export {
 	runDoctorProbes,
@@ -90,6 +97,8 @@ export {
 } from './delegate.js'
 export {
 	CodeIntelService,
+	type CodeIntelAstSearchOptions,
+	type CodeIntelAstSearchResult,
 	type CodeIntelOutline,
 	type CodeIntelDefinition,
 	type CodeIntelSearchResult,

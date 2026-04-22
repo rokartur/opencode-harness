@@ -29,20 +29,38 @@ export interface CodeIntelSearchResult {
 	text: string
 }
 
+export interface CodeIntelAstSearchResult {
+	filePath: string
+	startLine: number
+	startColumn: number
+	endLine: number
+	endColumn: number
+	text: string
+	language: string
+}
+
 export interface CodeIntelOptions {
 	enabled: boolean
 	cwd: string
+}
+
+export interface CodeIntelAstSearchOptions {
+	path?: string
+	lang?: string
+	limit?: number
 }
 
 export class CodeIntelService {
 	private readonly enabled: boolean
 	private readonly cwd: string
 	private readonly rgAvailable: boolean
+	private readonly astGrepBinary: string | null
 
 	constructor(options: CodeIntelOptions) {
 		this.enabled = options.enabled
 		this.cwd = options.cwd
 		this.rgAvailable = this.checkRg()
+		this.astGrepBinary = this.detectAstGrepBinary()
 	}
 
 	isEnabled(): boolean {
@@ -117,6 +135,39 @@ export class CodeIntelService {
 		}
 	}
 
+	hasAstSearch(): boolean {
+		return this.astGrepBinary !== null
+	}
+
+	astSearch(pattern: string, options: CodeIntelAstSearchOptions = {}): CodeIntelAstSearchResult[] | null {
+		if (!this.enabled) return []
+		if (!this.astGrepBinary) return null
+		const targetPath = resolve(this.cwd, options.path ?? '.')
+		if (options.path && !fileExists(targetPath)) return []
+		const args = ['run', '--pattern', pattern, '--json=compact']
+		if (options.lang) args.push('--lang', options.lang)
+		args.push(targetPath)
+		try {
+			const result = spawnSync(this.astGrepBinary, args, {
+				cwd: this.cwd,
+				encoding: 'utf-8',
+				stdio: ['ignore', 'pipe', 'ignore'],
+				timeout: 15_000,
+				maxBuffer: 10 * 1024 * 1024,
+			})
+			const raw = (result.stdout ?? '').trim()
+			if (!raw) return []
+			const parsed = JSON.parse(raw) as unknown
+			const rows = Array.isArray(parsed) ? parsed : []
+			const matches = rows
+				.map(row => mapAstSearchResult(this.cwd, row))
+				.filter((row): row is CodeIntelAstSearchResult => row !== null)
+			return matches.slice(0, options.limit ?? 50)
+		} catch {
+			return []
+		}
+	}
+
 	private checkRg(): boolean {
 		try {
 			const result = spawnSync('rg', ['--version'], { stdio: 'ignore', timeout: 3000 })
@@ -124,6 +175,18 @@ export class CodeIntelService {
 		} catch {
 			return false
 		}
+	}
+
+	private detectAstGrepBinary(): string | null {
+		for (const candidate of [resolve(this.cwd, 'ast-grep'), resolve(this.cwd, 'sg'), 'ast-grep', 'sg']) {
+			try {
+				const result = spawnSync(candidate, ['--version'], { stdio: 'ignore', timeout: 3000 })
+				if (result.status === 0) return candidate
+			} catch {
+				// ignore
+			}
+		}
+		return null
 	}
 }
 
@@ -161,4 +224,24 @@ function extractOutlineSymbols(
 
 function escapeRegex(input: string): string {
 	return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function mapAstSearchResult(cwd: string, row: unknown): CodeIntelAstSearchResult | null {
+	if (!row || typeof row !== 'object') return null
+	const record = row as Record<string, unknown>
+	const file = typeof record.file === 'string' ? record.file : ''
+	const range = record.range && typeof record.range === 'object' ? (record.range as Record<string, unknown>) : null
+	const start = range?.start && typeof range.start === 'object' ? (range.start as Record<string, unknown>) : null
+	const end = range?.end && typeof range.end === 'object' ? (range.end as Record<string, unknown>) : null
+	if (!file || !start || !end) return null
+	const relativePath = file.startsWith(cwd) ? file.slice(cwd.length + 1) : file
+	return {
+		filePath: relativePath,
+		startLine: Number(start.line ?? 0) + 1,
+		startColumn: Number(start.column ?? 0) + 1,
+		endLine: Number(end.line ?? 0) + 1,
+		endColumn: Number(end.column ?? 0) + 1,
+		text: typeof record.text === 'string' ? record.text : '',
+		language: typeof record.language === 'string' ? record.language : '',
+	}
 }
