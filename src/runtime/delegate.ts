@@ -78,6 +78,15 @@ export interface DelegateOptions {
 	sessionAdapter: DelegateSessionAdapter | null
 }
 
+interface DelegatePendingSessionRequest {
+	agent: string
+	prompt: string
+	context?: string
+	model?: string
+	cwd: string
+	parentSessionID?: string
+}
+
 const DEFAULT_OPTIONS: DelegateOptions = {
 	enabled: false,
 	maxConcurrent: 2,
@@ -91,6 +100,9 @@ export class DelegateService {
 	private readonly options: DelegateOptions
 	private readonly jobs = new Map<string, DelegateJob>()
 	private readonly childProcesses = new Map<string, ChildProcess>()
+	private readonly pendingSessionRequests = new Map<string, DelegatePendingSessionRequest>()
+	private draining = false
+	private drainRequested = false
 	private nextId = 1
 
 	constructor(options: Partial<DelegateOptions> = {}) {
@@ -125,7 +137,7 @@ export class DelegateService {
 		}
 		this.jobs.set(id, job)
 		this.persist()
-		this.runJob(id)
+		this.queueDrain()
 		return cloneJob(job)
 	}
 
@@ -164,8 +176,8 @@ export class DelegateService {
 			kind: input.kind,
 			mode: 'session',
 			command: '',
-			status: 'running',
-			startedAt: Date.now(),
+			status: 'pending',
+			startedAt: null,
 			completedAt: null,
 			exitCode: null,
 			output: '',
@@ -176,37 +188,17 @@ export class DelegateService {
 			parentSessionID: input.parentSessionID,
 		}
 		this.jobs.set(id, job)
+		this.pendingSessionRequests.set(id, {
+			agent: input.agent,
+			prompt: input.prompt,
+			context: input.context,
+			model: input.model,
+			cwd,
+			parentSessionID: input.parentSessionID,
+		})
 		this.persist()
-		try {
-			const created = await this.options.sessionAdapter.createSession({
-				label: input.label,
-				cwd,
-				parentSessionID: input.parentSessionID,
-			})
-			job.sessionID = created.sessionID
-			const fullPrompt = input.context ? `${input.context}\n\n---\n\n${input.prompt}` : input.prompt
-			const dispatched = await this.options.sessionAdapter.promptSession({
-				sessionID: created.sessionID,
-				agent: input.agent,
-				prompt: fullPrompt,
-				model: input.model,
-				cwd,
-			})
-			job.taskID = dispatched.taskID
-			job.output = truncateOutput(dispatched.output ?? '')
-			if (dispatched.status === 'done') {
-				job.status = 'done'
-				job.completedAt = Date.now()
-			}
-			this.persist()
-			return cloneJob(job)
-		} catch (error) {
-			job.status = 'failed'
-			job.error = error instanceof Error ? error.message : String(error)
-			job.completedAt = Date.now()
-			this.persist()
-			return cloneJob(job)
-		}
+		await this.runNextPending()
+		return cloneJob(this.jobs.get(id) ?? job)
 	}
 
 	getStatus(id: string): DelegateJob | null {
@@ -220,6 +212,7 @@ export class DelegateService {
 		if (job.mode !== 'session' || !job.sessionID || !this.options.sessionAdapter?.inspectSession) {
 			return cloneJob(job)
 		}
+		const previousStatus = job.status
 		try {
 			const inspection = await this.options.sessionAdapter.inspectSession({
 				sessionID: job.sessionID,
@@ -233,6 +226,7 @@ export class DelegateService {
 				job.completedAt = Date.now()
 			}
 			this.persist()
+			if (previousStatus === 'running' && job.status !== 'running') await this.runNextPending()
 			return cloneJob(job)
 		} catch (error) {
 			job.error = error instanceof Error ? error.message : String(error)
@@ -250,6 +244,11 @@ export class DelegateService {
 	async continue(id: string, prompt: string, context?: string): Promise<DelegateJob | null> {
 		const job = this.jobs.get(id)
 		if (!job || job.mode !== 'session' || !job.sessionID || !job.agent || !this.options.sessionAdapter) return null
+		if (job.status !== 'running' && this.countByStatus('running') >= this.options.maxConcurrent) {
+			job.error = 'delegate concurrency limit reached'
+			this.persist()
+			return cloneJob(job)
+		}
 		const send = this.options.sessionAdapter.continueSession ?? this.options.sessionAdapter.promptSession
 		const fullPrompt = context ? `${context}\n\n---\n\n${prompt}` : prompt
 		try {
@@ -286,7 +285,7 @@ export class DelegateService {
 		job.completedAt = Date.now()
 		if (job.mode === 'shell') {
 			const child = this.childProcesses.get(id)
-			if (child && !child.killed) child.kill('SIGTERM')
+			if (child) terminateProcessTree(child)
 			this.childProcesses.delete(id)
 		} else if (job.mode === 'session' && job.sessionID && this.options.sessionAdapter?.abortSession) {
 			try {
@@ -295,8 +294,9 @@ export class DelegateService {
 				job.error = error instanceof Error ? error.message : String(error)
 			}
 		}
+		this.pendingSessionRequests.delete(id)
 		this.persist()
-		this.runNextPending()
+		await this.runNextPending()
 		return cloneJob(job)
 	}
 
@@ -362,9 +362,10 @@ export class DelegateService {
 
 	reset(): void {
 		for (const child of this.childProcesses.values()) {
-			if (!child.killed) child.kill('SIGTERM')
+			terminateProcessTree(child)
 		}
 		this.childProcesses.clear()
+		this.pendingSessionRequests.clear()
 		this.jobs.clear()
 		this.nextId = 1
 		this.persist()
@@ -406,10 +407,13 @@ export class DelegateService {
 		return cloneJob(job)
 	}
 
-	private runJob(id: string): void {
+	private queueDrain(): void {
+		void this.runNextPending()
+	}
+
+	private runShellJob(id: string): void {
 		const job = this.jobs.get(id)
 		if (!job || job.status !== 'pending' || job.mode !== 'shell') return
-		if (this.countByStatus('running') >= this.options.maxConcurrent) return
 
 		job.status = 'running'
 		job.startedAt = Date.now()
@@ -419,6 +423,7 @@ export class DelegateService {
 			cwd: job.cwd || this.options.cwd || undefined,
 			stdio: ['ignore', 'pipe', 'pipe'],
 			timeout: 120_000,
+			detached: true,
 		})
 		this.childProcesses.set(id, child)
 
@@ -445,7 +450,7 @@ export class DelegateService {
 				job.completedAt = Date.now()
 			}
 			this.persist()
-			this.runNextPending()
+			this.queueDrain()
 		})
 
 		child.on('error', err => {
@@ -456,16 +461,72 @@ export class DelegateService {
 				job.completedAt = Date.now()
 			}
 			this.persist()
-			this.runNextPending()
+			this.queueDrain()
 		})
 	}
 
-	private runNextPending(): void {
-		for (const job of this.jobs.values()) {
-			if (job.status === 'pending' && job.mode === 'shell') {
-				this.runJob(job.id)
-				return
+	private async dispatchSessionJob(id: string): Promise<void> {
+		const job = this.jobs.get(id)
+		const pending = this.pendingSessionRequests.get(id)
+		if (!job || job.mode !== 'session' || job.status !== 'pending' || !pending || !this.options.sessionAdapter)
+			return
+		job.status = 'running'
+		job.startedAt = Date.now()
+		job.error = ''
+		this.persist()
+		try {
+			const created = await this.options.sessionAdapter.createSession({
+				label: job.label,
+				cwd: pending.cwd,
+				parentSessionID: pending.parentSessionID,
+			})
+			job.sessionID = created.sessionID
+			const fullPrompt = pending.context ? `${pending.context}\n\n---\n\n${pending.prompt}` : pending.prompt
+			const dispatched = await this.options.sessionAdapter.promptSession({
+				sessionID: created.sessionID,
+				agent: pending.agent,
+				prompt: fullPrompt,
+				model: pending.model,
+				cwd: pending.cwd,
+			})
+			job.taskID = dispatched.taskID
+			job.output = truncateOutput(dispatched.output ?? '')
+			if (dispatched.status === 'done') {
+				job.status = 'done'
+				job.completedAt = Date.now()
 			}
+			this.pendingSessionRequests.delete(id)
+			this.persist()
+		} catch (error) {
+			job.status = 'failed'
+			job.error = error instanceof Error ? error.message : String(error)
+			job.completedAt = Date.now()
+			this.pendingSessionRequests.delete(id)
+			this.persist()
+		}
+	}
+
+	private async runNextPending(): Promise<void> {
+		if (this.draining) {
+			this.drainRequested = true
+			return
+		}
+		this.draining = true
+		try {
+			do {
+				this.drainRequested = false
+				while (this.countByStatus('running') < this.options.maxConcurrent) {
+					const next = Array.from(this.jobs.values()).find(job => job.status === 'pending')
+					if (!next) return
+					if (next.mode === 'shell') {
+						this.runShellJob(next.id)
+						continue
+					}
+					await this.dispatchSessionJob(next.id)
+				}
+			} while (this.drainRequested)
+		} finally {
+			this.draining = false
 		}
 	}
 
@@ -520,4 +581,29 @@ function cloneJob(job: DelegateJob): DelegateJob {
 
 function lastTouched(job: DelegateJob): number {
 	return job.completedAt || job.startedAt || 0
+}
+
+function terminateProcessTree(child: ChildProcess): void {
+	const pid = child.pid
+	if (typeof pid === 'number' && Number.isFinite(pid) && pid > 0) {
+		try {
+			process.kill(-pid, 'SIGTERM')
+		} catch {
+			// ignore
+		}
+		setTimeout(() => {
+			try {
+				process.kill(-pid, 'SIGKILL')
+			} catch {
+				// ignore
+			}
+		}, 400).unref?.()
+	}
+	if (!child.killed) {
+		try {
+			child.kill('SIGTERM')
+		} catch {
+			// ignore
+		}
+	}
 }

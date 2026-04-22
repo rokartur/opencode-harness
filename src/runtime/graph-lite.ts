@@ -289,8 +289,12 @@ export class GraphLiteService {
 		return results
 	}
 
-	getCallees(filePath: string): Array<{ symbolName: string; sourcePath: string }> {
+	getImportedSymbols(filePath: string): Array<{ symbolName: string; sourcePath: string }> {
 		return this.findFile(filePath)?.symbolRefs ?? []
+	}
+
+	getCallees(filePath: string): Array<{ symbolName: string; sourcePath: string }> {
+		return this.getImportedSymbols(filePath)
 	}
 
 	getSymbolSignature(filePath: string, symbolName: string): GraphLiteSymbolSignature | null {
@@ -381,7 +385,7 @@ export class GraphLiteService {
 		}
 	}
 
-	getCallGraphCycles(limit: number = 10): GraphLiteCallCycle[] {
+	getImportCycleHints(limit: number = 10): GraphLiteCallCycle[] {
 		return this.getCircularDependencyCycles(limit).map(cycle => ({
 			cycle: cycle.map(path => {
 				const file = this.findFile(path)
@@ -393,6 +397,10 @@ export class GraphLiteService {
 				}
 			}),
 		}))
+	}
+
+	getCallGraphCycles(limit: number = 10): GraphLiteCallCycle[] {
+		return this.getImportCycleHints(limit)
 	}
 
 	getCircularDependencyCycles(limit: number = 10): string[][] {
@@ -623,8 +631,10 @@ export class GraphLiteService {
 
 function walkIndexableFiles(cwd: string, maxFiles: number): string[] {
 	const files: string[] = []
-	function walk(dir: string): void {
+	function walk(dir: string): boolean {
+		if (files.length >= maxFiles) return true
 		for (const entry of readdirSync(dir)) {
+			if (files.length >= maxFiles) return true
 			const absPath = join(dir, entry)
 			const relPath = relative(cwd, absPath)
 			let stat
@@ -635,13 +645,14 @@ function walkIndexableFiles(cwd: string, maxFiles: number): string[] {
 			}
 			if (stat.isDirectory()) {
 				if (IGNORED_DIRS.has(entry)) continue
-				walk(absPath)
+				if (walk(absPath)) return true
 				continue
 			}
 			if (!INDEXABLE_EXTS.has(extname(entry).toLowerCase())) continue
 			files.push(relPath)
-			if (files.length >= maxFiles) return
+			if (files.length >= maxFiles) return true
 		}
+		return false
 	}
 	if (fileExists(cwd)) walk(cwd)
 	return files.sort()

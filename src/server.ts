@@ -98,6 +98,7 @@ import {
 	buildAnchoredView,
 	buildAnchoredViewFromFile,
 	CommentChecker,
+	detectAstGrepBinary,
 	getCodeStatsReport,
 } from './runtime/index.js'
 import { DelegateService, type DelegateSessionAdapter } from './runtime/delegate.js'
@@ -570,7 +571,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				rtkAvailable,
 				cavememAvailable,
 				rgAvailable,
-				astGrepAvailable: checkBinary('ast-grep') || checkBinary('sg'),
+				astGrepAvailable: detectAstGrepBinary(directory) !== null,
 				gitAvailable: checkBinary('git'),
 				bunAvailable: checkBinary('bun'),
 			},
@@ -1410,13 +1411,15 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			}),
 			openharness_graph_symbols: toolFn({
 				description:
-					'Query symbol-level graph-lite information: find/search, signature lookup, callers/callees, references, blast radius, and approximate call cycles.',
+					'Query symbol-level plus import-graph parity information: find/search, signature lookup, callers, file import lists, references, blast radius, and approximate import cycles.',
 				args: {
 					action: z.enum([
 						'find',
 						'search',
 						'signature',
 						'callers',
+						'imports',
+						'import_cycles',
 						'callees',
 						'references',
 						'blast_radius',
@@ -1444,19 +1447,32 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 									match.filePath === args.file ||
 									match.filePath.endsWith(args.file.replace(/^\.\//, '')),
 							)
-					if (args.action === 'call_cycles') {
-						const cycles = graphLite.getCallGraphCycles(limit)
-						if (cycles.length === 0) return 'No approximate call cycles found.'
-						return cycles
-							.map(
-								(cycle, index) =>
-									`- Cycle ${index + 1}: ${cycle.cycle.map(entry => `${entry.name}@${entry.path}:${entry.line}`).join(' -> ')}`,
+					if (args.action === 'call_cycles' || args.action === 'import_cycles') {
+						const cycles = graphLite.getImportCycleHints(limit)
+						if (cycles.length === 0) return 'No approximate import cycles found.'
+						const lines =
+							args.action === 'call_cycles'
+								? [
+										'Approx import-cycle parity for compatibility `call_cycles` (not semantic call graph cycles).',
+										'',
+									]
+								: ['Approx import cycles from graph-lite import edges.', '']
+						return lines
+							.concat(
+								cycles.map(
+									(cycle, index) =>
+										`- Cycle ${index + 1}: ${cycle.cycle.map(entry => `${entry.name}@${entry.path}:${entry.line}`).join(' -> ')}`,
+								),
 							)
 							.join('\n')
 					}
-					if (!args.name) return 'name parameter required'
+					if ((args.action === 'imports' || args.action === 'callees') && !args.file && !args.name) {
+						return 'file parameter required for imports (or provide name to infer containing file)'
+					}
+					if (!args.name && args.action !== 'imports' && args.action !== 'callees')
+						return 'name parameter required'
 					if (args.action === 'find' || args.action === 'search') {
-						const matches = scopeMatches(args.name).slice(0, limit)
+						const matches = scopeMatches(args.name!).slice(0, limit)
 						if (matches.length === 0) return `No symbols found matching '${args.name}'`
 						return matches
 							.map(
@@ -1466,7 +1482,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 							.join('\n')
 					}
 					if (args.action === 'references') {
-						const refs = graphLite.getSymbolReferences(args.name, limit)
+						const refs = graphLite.getSymbolReferences(args.name!, limit)
 						if (refs.length === 0) return `No references found for '${args.name}'.`
 						return refs
 							.map(
@@ -1476,7 +1492,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 							.join('\n')
 					}
 					if (args.action === 'blast_radius') {
-						const blast = graphLite.getSymbolBlastRadius(args.name, 5)
+						const blast = graphLite.getSymbolBlastRadius(args.name!, 5)
 						if (blast.totalAffected === 0) return `No transitive callers found for '${args.name}'.`
 						return [
 							`Root: ${blast.root.name} @ ${blast.root.path}:${blast.root.line}`,
@@ -1486,9 +1502,11 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 								.map(entry => `- ${entry.name} @ ${entry.path}:${entry.line} (depth ${entry.depth})`),
 						].join('\n')
 					}
-					const matches = scopeMatches(args.name)
+					const matches = args.name ? scopeMatches(args.name) : []
 					const selected = matches[0]
-					if (!selected) return `No symbols found matching '${args.name}'`
+					if (!selected && args.action !== 'imports' && args.action !== 'callees') {
+						return `No symbols found matching '${args.name}'`
+					}
 					if (args.action === 'signature') {
 						const signature = graphLite.getSymbolSignature(selected.filePath, selected.symbol.name)
 						if (!signature) return `No signature found for '${args.name}'.`
@@ -1507,13 +1525,19 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 							.map(caller => `- ${caller.filePath} imports ${caller.symbolName}`)
 							.join('\n')
 					}
-					const calleeFile = args.file ?? selected.filePath
-					const callees = graphLite.getCallees(calleeFile)
-					if (callees.length === 0) return `No callees found for '${calleeFile}'.`
-					return callees
-						.slice(0, limit)
-						.map(callee => `- ${callee.symbolName} from ${callee.sourcePath}`)
-						.join('\n')
+					const importFile = args.file ?? selected?.filePath
+					if (!importFile) return 'file parameter required for imports'
+					const imports = graphLite.getImportedSymbols(importFile)
+					if (imports.length === 0) return `No import-graph matches found for '${importFile}'.`
+					const header =
+						args.action === 'callees'
+							? `Approx import parity for compatibility \`callees\` from ${importFile} (not per-symbol semantic callees).`
+							: `Approx file imports for ${importFile}.`
+					return [
+						header,
+						'',
+						...imports.slice(0, limit).map(entry => `- ${entry.symbolName} from ${entry.sourcePath}`),
+					].join('\n')
 				},
 			}),
 			openharness_graph_analyze: toolFn({

@@ -50,6 +50,18 @@ export interface CodeIntelAstSearchOptions {
 	limit?: number
 }
 
+export function detectAstGrepBinary(cwd: string): string | null {
+	for (const candidate of [resolve(cwd, 'ast-grep'), resolve(cwd, 'sg'), 'ast-grep', 'sg']) {
+		try {
+			const result = spawnSync(candidate, ['--version'], { stdio: 'ignore', timeout: 3000 })
+			if (result.status === 0) return candidate
+		} catch {
+			// ignore
+		}
+	}
+	return null
+}
+
 export class CodeIntelService {
 	private readonly enabled: boolean
 	private readonly cwd: string
@@ -60,7 +72,7 @@ export class CodeIntelService {
 		this.enabled = options.enabled
 		this.cwd = options.cwd
 		this.rgAvailable = this.checkRg()
-		this.astGrepBinary = this.detectAstGrepBinary()
+		this.astGrepBinary = detectAstGrepBinary(this.cwd)
 	}
 
 	isEnabled(): boolean {
@@ -175,18 +187,6 @@ export class CodeIntelService {
 		} catch {
 			return false
 		}
-	}
-
-	private detectAstGrepBinary(): string | null {
-		for (const candidate of [resolve(this.cwd, 'ast-grep'), resolve(this.cwd, 'sg'), 'ast-grep', 'sg']) {
-			try {
-				const result = spawnSync(candidate, ['--version'], { stdio: 'ignore', timeout: 3000 })
-				if (result.status === 0) return candidate
-			} catch {
-				// ignore
-			}
-		}
-		return null
 	}
 }
 

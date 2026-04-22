@@ -97,6 +97,7 @@ export {
 } from './delegate.js'
 export {
 	CodeIntelService,
+	detectAstGrepBinary,
 	type CodeIntelAstSearchOptions,
 	type CodeIntelAstSearchResult,
 	type CodeIntelOutline,
