@@ -26,6 +26,10 @@ export class WorkflowEngine {
 
 	readonly workflowMode: WorkflowRuntimeMode
 
+	initialize(sessionID: string): WorkflowStatusSnapshot {
+		return toWorkflowStatusSnapshot(this.store.set(createWorkflowState(sessionID, this.workflowMode)))
+	}
+
 	getState(sessionID: string) {
 		return this.store.get(sessionID) ?? createWorkflowState(sessionID, this.workflowMode)
 	}

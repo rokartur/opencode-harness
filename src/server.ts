@@ -1993,6 +1993,10 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 						.enum(['pass', 'fail', 'flaky', 'unknown'])
 						.optional()
 						.describe('Optional explicit verification status override'),
+					outcome: z
+						.enum(['edit', 'done', 'blocked'])
+						.optional()
+						.describe('Optional workflow outcome after backprop (default: edit when mutation succeeds).'),
 					summary: z.string().optional().describe('Optional verification summary override'),
 					exitCode: z.number().optional().describe('Optional exit code override'),
 				},
@@ -2014,12 +2018,133 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 						runtime.plan ?? workflow?.executionPlan ?? null,
 						verification,
 					)
+					const nextOutcome =
+						args.outcome ?? (changed ? (verification.status === 'pass' ? 'done' : 'edit') : 'blocked')
+					if (workflow) {
+						workflowEngine.dispatch(ctx.sessionID, {
+							type: 'BACKPROP_COMPLETED',
+							outcome: nextOutcome,
+							message: changed
+								? 'verification backpropped into SPEC.md'
+								: 'no SPEC backprop mutation was applied',
+						})
+						syncWorkflowRuntime(ctx.sessionID)
+					}
 					return [
 						`Path: ${toDisplayPath(ctx.directory, resolveCaveKitSpecPath(ctx.directory))}`,
 						`Verification: ${verification.command} -> ${verification.status}`,
 						`Mutator mode: ${cavekitMutatorMode}`,
 						`Changed: ${changed ? 'yes' : 'no'}`,
+						`Workflow outcome: ${nextOutcome}`,
 					].join('\n')
+				},
+			}),
+			openharness_workflow_control: toolFn({
+				description:
+					'Control the hard workflow engine: record an explicit no-op, retry or close after backprop, cancel, or restart the current workflow.',
+				args: {
+					action: z
+						.enum(['no-op', 'retry', 'close', 'block', 'cancel', 'restart'])
+						.describe('Workflow control action'),
+					note: z.string().optional().describe('Optional note recorded in the workflow response'),
+				},
+				async execute(args, ctx) {
+					const workflow = workflowEngine.getSnapshot(ctx.sessionID)
+					if (!workflow) return 'No workflow state for this session.'
+					const note = args.note?.trim() || ''
+					if (args.action === 'no-op') {
+						if (workflow.phase !== 'edit') return 'No-op can only be recorded during the edit phase.'
+						const next = workflowEngine.dispatch(ctx.sessionID, {
+							type: 'EDIT_APPLIED',
+							currentTarget: workflow.currentTarget,
+							noOp: true,
+						})
+						syncWorkflowRuntime(ctx.sessionID)
+						return [
+							`Action: no-op`,
+							`Phase: ${getWorkflowPhaseLabel(next.phase)}`,
+							note ? `Note: ${note}` : '',
+						]
+							.filter(Boolean)
+							.join('\n')
+					}
+					if (args.action === 'retry') {
+						if (workflow.phase !== 'backprop') return 'Retry is only available during the backprop phase.'
+						const next = workflowEngine.dispatch(ctx.sessionID, {
+							type: 'BACKPROP_COMPLETED',
+							outcome: 'edit',
+							message: note || 'retry requested',
+						})
+						syncWorkflowRuntime(ctx.sessionID)
+						return [
+							`Action: retry`,
+							`Phase: ${getWorkflowPhaseLabel(next.phase)}`,
+							note ? `Note: ${note}` : '',
+						]
+							.filter(Boolean)
+							.join('\n')
+					}
+					if (args.action === 'close') {
+						if (workflow.phase !== 'backprop') return 'Close is only available during the backprop phase.'
+						const next = workflowEngine.dispatch(ctx.sessionID, {
+							type: 'BACKPROP_COMPLETED',
+							outcome: 'done',
+							message: note || 'close requested after backprop',
+						})
+						syncWorkflowRuntime(ctx.sessionID)
+						return [
+							`Action: close`,
+							`Phase: ${getWorkflowPhaseLabel(next.phase)}`,
+							note ? `Note: ${note}` : '',
+						]
+							.filter(Boolean)
+							.join('\n')
+					}
+					if (args.action === 'block') {
+						if (workflow.phase !== 'backprop') return 'Block is only available during the backprop phase.'
+						const next = workflowEngine.dispatch(ctx.sessionID, {
+							type: 'BACKPROP_COMPLETED',
+							outcome: 'blocked',
+							message: note || 'blocked after backprop',
+						})
+						syncWorkflowRuntime(ctx.sessionID)
+						return [
+							`Action: block`,
+							`Phase: ${getWorkflowPhaseLabel(next.phase)}`,
+							note ? `Note: ${note}` : '',
+						]
+							.filter(Boolean)
+							.join('\n')
+					}
+					if (args.action === 'cancel') {
+						const next = workflowEngine.dispatch(ctx.sessionID, {
+							type: 'WORKFLOW_CANCELLED',
+							reason: note || 'cancel requested',
+						})
+						syncWorkflowRuntime(ctx.sessionID)
+						return [
+							`Action: cancel`,
+							`Phase: ${getWorkflowPhaseLabel(next.phase)}`,
+							note ? `Note: ${note}` : '',
+						]
+							.filter(Boolean)
+							.join('\n')
+					}
+					const next = workflowEngine.dispatch(ctx.sessionID, {
+						type: 'USER_GOAL_RECEIVED',
+						goalHash:
+							workflow.goalHash ||
+							workflowEngine.createGoalHash(workflow.compiledPrompt?.goal || 'restart'),
+						workflowMode: workflow.workflowMode,
+					})
+					syncWorkflowRuntime(ctx.sessionID)
+					return [
+						`Action: restart`,
+						`Phase: ${getWorkflowPhaseLabel(next.phase)}`,
+						note ? `Note: ${note}` : '',
+					]
+						.filter(Boolean)
+						.join('\n')
 				},
 			}),
 			openharness_caveman_compress_file: toolFn({
@@ -2522,6 +2647,30 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			const lockedValidationCommand = rawCommand
 				? workflowEngine.resolveValidationCommand(hookInput.sessionID, rawCommand)
 				: ''
+			if (hookInput.tool === 'read') {
+				workflowEngine.dispatch(hookInput.sessionID, {
+					type: 'READ_COMPLETED',
+					target:
+						typeof hookInput.args?.filePath === 'string'
+							? hookInput.args.filePath
+							: (touchedArtifacts[0] ?? workflowBefore?.currentTarget),
+					tool: hookInput.tool,
+				})
+			}
+			if (
+				hookInput.tool === 'glob' ||
+				hookInput.tool === 'grep' ||
+				hookInput.tool.startsWith('openharness_graph_') ||
+				hookInput.tool.startsWith('openharness_intel_') ||
+				hookInput.tool === 'openharness_cavemem_recall' ||
+				hookInput.tool.startsWith('cavemem_')
+			) {
+				workflowEngine.dispatch(hookInput.sessionID, {
+					type: 'GRAPH_HINTS_UPDATED',
+					currentTarget: touchedArtifacts[0] ?? workflowBefore?.currentTarget,
+					summary: hookInput.tool,
+				})
+			}
 			if (isWorkflowMutationTool(hookInput.tool) && workflowBefore?.phase === 'edit') {
 				workflowEngine.dispatch(hookInput.sessionID, {
 					type: 'EDIT_APPLIED',
@@ -2569,7 +2718,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					workflowBefore?.phase.startsWith('delegate_')
 				) {
 					workflowEngine.dispatch(hookInput.sessionID, {
-						type: 'DELEGATE_COMPLETED',
+						type: 'DELEGATE_FINISHED',
 						jobId: job.id,
 						status: job.status,
 						result: job.status === 'failed' ? 'block' : 'advance',
@@ -2623,7 +2772,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 						if (nudge) await appendPromptToSession(hookInput.sessionID, nudge.message)
 					}
 				}
-				if (cavekitMutatorMode === 'opencode-integrated') {
+				if (cavekitMutatorMode === 'opencode-integrated' && config.workflowMode !== 'strict') {
 					applyVerificationToSpec(
 						sessionRuntime.snapshot().plan ??
 							workflowEngine.getSnapshot(hookInput.sessionID)?.executionPlan ??
@@ -2638,15 +2787,6 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 						status: verification.status,
 					})
 				}
-			}
-			if (
-				hookInput.tool === 'openharness_cavekit_backprop' &&
-				workflowEngine.getSnapshot(hookInput.sessionID)?.phase === 'backprop'
-			) {
-				workflowEngine.dispatch(hookInput.sessionID, {
-					type: 'BACKPROP_COMPLETED',
-					outcome: 'blocked',
-				})
 			}
 			maybeSetNextStep(sessionState, sessionRuntime, hookInput)
 			syncWorkflowRuntime(hookInput.sessionID)
@@ -3061,6 +3201,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			}
 			if (type === 'session.created' && sessionId) {
 				const runtime = getSessionRuntime(sessionId)
+				workflowEngine.initialize(sessionId)
 				runtime.setPhase('load-context')
 				runtime.setMemoryProtocol(describeMemoryProtocol())
 				refreshDoctorSummary(sessionId)

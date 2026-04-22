@@ -26,6 +26,16 @@ export function reduceWorkflow(currentState: WorkflowState, event: WorkflowEvent
 				},
 			)
 
+		case 'READ_COMPLETED':
+			return transition(current, current.phase, 'read completed', {
+				currentTarget: event.target?.trim() || current.currentTarget,
+			})
+
+		case 'GRAPH_HINTS_UPDATED':
+			return transition(current, current.phase, 'graph hints updated', {
+				currentTarget: event.currentTarget?.trim() || current.currentTarget,
+			})
+
 		case 'CONTEXT_READY':
 			return transition(current, 'compile_prompt', 'context ready', {
 				currentTarget: event.currentTarget?.trim() || current.currentTarget,
@@ -54,7 +64,7 @@ export function reduceWorkflow(currentState: WorkflowState, event: WorkflowEvent
 		}
 
 		case 'EDIT_APPLIED':
-			return transition(current, 'run', 'edit applied', {
+			return transition(current, 'run', event.noOp ? 'no-op recorded' : 'edit applied', {
 				currentTarget: event.currentTarget?.trim() || current.currentTarget,
 			})
 
@@ -116,6 +126,7 @@ export function reduceWorkflow(currentState: WorkflowState, event: WorkflowEvent
 				delegateParentPhase: event.parentPhase ?? current.phase,
 			})
 
+		case 'DELEGATE_FINISHED':
 		case 'DELEGATE_COMPLETED': {
 			if (event.result === 'block' || event.status === 'failed') {
 				return transition(current, 'blocked', `delegate ${event.status} (${event.jobId})`, {

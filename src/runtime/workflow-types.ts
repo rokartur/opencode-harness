@@ -83,8 +83,19 @@ export type WorkflowEvent =
 			workPacket?: WorkflowWorkPacket
 	  }
 	| {
+			type: 'READ_COMPLETED'
+			target?: string
+			tool?: string
+	  }
+	| {
+			type: 'GRAPH_HINTS_UPDATED'
+			currentTarget?: string
+			summary?: string
+	  }
+	| {
 			type: 'EDIT_APPLIED'
 			currentTarget?: string
+			noOp?: boolean
 	  }
 	| {
 			type: 'RUN_COMPLETED'
@@ -105,6 +116,13 @@ export type WorkflowEvent =
 			jobId: string
 			kind: 'index' | 'review' | 'research' | 'custom'
 			parentPhase?: WorkflowPhase
+	  }
+	| {
+			type: 'DELEGATE_FINISHED'
+			jobId: string
+			status: 'done' | 'failed' | 'cancelled'
+			resumePhase?: WorkflowPhase
+			result?: 'advance' | 'block' | 'reopen'
 	  }
 	| {
 			type: 'DELEGATE_COMPLETED'
@@ -152,6 +170,7 @@ const STATUS_TOOLS = [
 	'openharness_delegate_list',
 	'openharness_delegate_audit',
 	'openharness_skill',
+	'openharness_workflow_control',
 ]
 
 export function createWorkflowState(sessionID: string, workflowMode: WorkflowRuntimeMode = 'advisory'): WorkflowState {
