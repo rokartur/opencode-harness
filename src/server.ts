@@ -1,5 +1,6 @@
 import type { Plugin } from '@opencode-ai/plugin'
 import { spawnSync } from 'node:child_process'
+import { rmSync } from 'node:fs'
 import { relative, resolve } from 'node:path'
 import {
 	discoverPluginRoots,
@@ -82,7 +83,8 @@ import { classifyVerification, combineVerificationRecords, createVerificationRec
 import { applyVerificationToSpec } from './runtime/backprop.js'
 import type { PluginConfig, CompatHook, LoadedCompatPlugin } from './shared/types.js'
 import { injectCavememMcp, isCavememAvailable } from './shared/cavemem.js'
-import { isRtkAvailable, rewriteCommandWithRtk } from './shared/rtk.js'
+import { isRtkAvailable, resolveRtkCommandCompression } from './shared/rtk.js'
+import { writeFileAtomic } from './shared/fs.js'
 
 const z = toolFn.schema
 
@@ -97,6 +99,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		options?.cavekitMutatorMode === 'strict-upstream' ? 'strict-upstream' : 'opencode-integrated'
 	const rtkBinary =
 		typeof options?.rtkBinary === 'string' && options.rtkBinary.trim() ? options.rtkBinary.trim() : 'rtk'
+	const rtkFallbackMode = options?.rtkFallbackMode === 'proxy' ? 'proxy' : 'passthrough'
 
 	const config: PluginConfig = {
 		allowProjectPlugins: options?.allowProjectPlugins === true,
@@ -124,6 +127,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		cavememDataDir: cavememSettings.dataDir,
 		enableRtk: options?.enableRtk === true,
 		rtkBinary,
+		rtkFallbackMode,
 	}
 
 	const cavememAvailable = config.enableCavememMcp ? isCavememAvailable(cavememBinary) : false
@@ -160,7 +164,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			body: {
 				service: 'opencode-harness',
 				level: 'warn',
-				message: `RTK enabled but binary '${rtkBinary}' is unavailable. Bash rewrite disabled.`,
+				message: `RTK enabled but binary '${rtkBinary}' is unavailable. L02 rewrite unavailable; commands pass through unchanged.`,
 			},
 		})
 	}
@@ -393,6 +397,26 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		return { records, combined: combineVerificationRecords(records) }
 	}
 
+	function applyBuildFileEdits(
+		directory: string,
+		writeFiles: Array<{ path: string; content: string }> = [],
+		deleteFiles: string[] = [],
+	): { written: string[]; deleted: string[] } {
+		const written: string[] = []
+		const deleted: string[] = []
+		for (const entry of writeFiles) {
+			const targetPath = resolveRepoLocalPath(directory, entry.path)
+			writeFileAtomic(targetPath, entry.content)
+			written.push(toDisplayPath(directory, targetPath))
+		}
+		for (const entry of deleteFiles) {
+			const targetPath = resolveRepoLocalPath(directory, entry)
+			rmSync(targetPath, { force: true, recursive: true })
+			deleted.push(toDisplayPath(directory, targetPath))
+		}
+		return { written, deleted }
+	}
+
 	function recordInvokedSkill(sessionID: string, skillName: string): void {
 		const existing = invokedSkillsBySession.get(sessionID) ?? new Set<string>()
 		existing.add(skillName)
@@ -534,12 +558,34 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 						return lines.join('\n')
 					}
 					if (mode === 'observations') {
-						const observations = getCaveMemObservations({
-							sessionID: ctx.sessionID,
-							cwd: ctx.directory,
-							maxResults: limit,
-							options: getCaveMemRuntimeOptions(ctx.sessionID),
-						})
+						const query =
+							args.query?.trim() || getLastPrompt(lastPromptBySession, ctx.sessionID) || 'recent work'
+						const observations =
+							config.enableCavememMcp && cavememAvailable
+								? ((await getCaveMemObservationsByIdsViaMcp(
+										{
+											ids: (
+												await searchCavememMemory(query, ctx.directory, ctx.sessionID, limit)
+											)
+												.slice(0, limit)
+												.map(memory => Number(memory.path.split('/').pop() ?? 0))
+												.filter(value => Number.isFinite(value) && value > 0),
+											cwd: ctx.directory,
+										},
+										{ binary: cavememBinary, dataDir: config.cavememDataDir },
+									)) ??
+									getCaveMemObservations({
+										sessionID: ctx.sessionID,
+										cwd: ctx.directory,
+										maxResults: limit,
+										options: getCaveMemRuntimeOptions(ctx.sessionID),
+									}))
+								: getCaveMemObservations({
+										sessionID: ctx.sessionID,
+										cwd: ctx.directory,
+										maxResults: limit,
+										options: getCaveMemRuntimeOptions(ctx.sessionID),
+									})
 						if (observations.length === 0) return [...lines, '', 'No CaveMem observations.'].join('\n')
 						lines.push('', '### Observations')
 						for (const observation of observations) {
@@ -659,6 +705,14 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 						.number()
 						.optional()
 						.describe('Timeout per validation command in milliseconds. Defaults 120000.'),
+					writeFiles: z
+						.array(z.object({ path: z.string(), content: z.string() }))
+						.optional()
+						.describe('Optional repo-local file writes to execute before verification.'),
+					deleteFiles: z
+						.array(z.string())
+						.optional()
+						.describe('Optional repo-local file paths to delete before verification.'),
 					syncLatestVerification: z
 						.boolean()
 						.optional()
@@ -678,6 +732,16 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 						runtime.setNextStep(
 							`Implement ${firstTask.id} and verify with ${result.validationCommands.join(' + ') || 'project checks'}.`,
 						)
+					}
+					const executedEdits = applyBuildFileEdits(
+						ctx.directory,
+						args.writeFiles ?? [],
+						args.deleteFiles ?? [],
+					)
+					if (executedEdits.written.length > 0 || executedEdits.deleted.length > 0) {
+						runtime.setPhase('edit')
+						const executedTargets = [...executedEdits.written, ...executedEdits.deleted]
+						runtime.setCurrentTarget(executedTargets[0] ?? firstTask?.task ?? '')
 					}
 					let verification: ReturnType<typeof combineVerificationRecords> | null = null
 					let verificationDetails = 'none'
@@ -728,6 +792,8 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 						`Goal: ${result.goal}`,
 						`Task coverage: ${result.taskCoverage}`,
 						`Changed: ${result.changed ? 'yes' : 'no'}`,
+						`Executed writes: ${executedEdits.written.join(', ') || 'none'}`,
+						`Executed deletes: ${executedEdits.deleted.join(', ') || 'none'}`,
 						`Verification sync: ${verificationDetails}`,
 						`Backprop applied: ${verificationSynced ? 'yes' : 'no'}`,
 						`Selected: ${result.selectedTasks.map(task => `${task.id}[${task.status}] ${task.task}`).join(' | ') || 'none'}`,
@@ -898,16 +964,20 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 							}
 						}
 
-						if (config.enableRtk && rtkAvailable && hookInput.tool === 'bash') {
+						if (config.enableRtk && hookInput.tool === 'bash') {
 							const command = typeof output.args?.command === 'string' ? output.args.command : ''
 							if (command) {
-								const rewritten = rewriteCommandWithRtk(command, rtkBinary)
-								getSessionRuntime(hookInput.sessionID).noteToolCompression(
-									command.length,
-									rewritten.length,
-								)
-								if (rewritten !== command) {
-									output.args = { ...(output.args ?? {}), command: rewritten }
+								const compression = resolveRtkCommandCompression(command, {
+									binary: rtkBinary,
+									fallbackMode: rtkFallbackMode,
+									available: rtkAvailable,
+								})
+								getSessionRuntime(hookInput.sessionID).noteToolCompression(compression)
+								if (
+									(compression.mode === 'rewritten' || compression.mode === 'proxied') &&
+									compression.finalCommand !== command
+								) {
+									output.args = { ...(output.args ?? {}), command: compression.finalCommand }
 								}
 							}
 						}

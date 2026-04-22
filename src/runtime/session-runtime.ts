@@ -5,6 +5,8 @@ import type {
 	ExecutionPlan,
 	SessionCompressionTelemetry,
 	SessionRuntimeSnapshot,
+	ToolCompressionRecord,
+	ToolCompressionTelemetryLayer,
 	VerificationRecord,
 } from './types.js'
 
@@ -68,8 +70,8 @@ export class SessionRuntimeTracker {
 		this.updatedAt = Date.now()
 	}
 
-	noteToolCompression(baselineChars: number, compressedChars: number): void {
-		recordTelemetry(this.telemetry.l02Tool, baselineChars, compressedChars)
+	noteToolCompression(record: ToolCompressionRecord): void {
+		recordToolCompression(this.telemetry.l02Tool, record)
 		this.updatedAt = Date.now()
 	}
 
@@ -142,7 +144,7 @@ export class SessionRuntimeTracker {
 function createEmptyTelemetry(): SessionCompressionTelemetry {
 	return {
 		l01Prompt: createEmptyLayer(),
-		l02Tool: createEmptyLayer(),
+		l02Tool: createEmptyToolLayer(),
 		l03Output: createEmptyLayer(),
 		l04Context: createEmptyLayer(),
 	}
@@ -160,6 +162,18 @@ function createEmptyLayer(): CompressionTelemetryLayer {
 	}
 }
 
+function createEmptyToolLayer(): ToolCompressionTelemetryLayer {
+	return {
+		...createEmptyLayer(),
+		rewrittenCount: 0,
+		proxiedCount: 0,
+		skippedCount: 0,
+		unavailableCount: 0,
+		lastMode: '',
+		lastReason: '',
+	}
+}
+
 function recordTelemetry(layer: CompressionTelemetryLayer, baselineChars: number, compressedChars: number): void {
 	const baseline = Math.max(0, baselineChars)
 	const compressed = Math.max(0, compressedChars)
@@ -171,6 +185,25 @@ function recordTelemetry(layer: CompressionTelemetryLayer, baselineChars: number
 	layer.lastBaselineChars = baseline
 	layer.lastCompressedChars = compressed
 	layer.lastSavedChars = saved
+}
+
+function recordToolCompression(layer: ToolCompressionTelemetryLayer, record: ToolCompressionRecord): void {
+	layer.lastMode = record.mode
+	layer.lastReason = record.reason.trim()
+	if (record.mode === 'rewritten') {
+		recordTelemetry(layer, record.baselineChars, record.compressedChars)
+		layer.rewrittenCount += 1
+		return
+	}
+	if (record.mode === 'proxied') {
+		layer.proxiedCount += 1
+		return
+	}
+	if (record.mode === 'unavailable') {
+		layer.unavailableCount += 1
+		return
+	}
+	layer.skippedCount += 1
 }
 
 function cloneTelemetry(telemetry: SessionCompressionTelemetry): SessionCompressionTelemetry {

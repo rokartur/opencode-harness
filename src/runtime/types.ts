@@ -57,9 +57,27 @@ export interface CompressionTelemetryLayer {
 	lastSavedChars: number
 }
 
+export type ToolCompressionMode = 'rewritten' | 'proxied' | 'skipped' | 'unavailable'
+
+export interface ToolCompressionRecord {
+	mode: ToolCompressionMode
+	baselineChars: number
+	compressedChars: number
+	reason: string
+}
+
+export interface ToolCompressionTelemetryLayer extends CompressionTelemetryLayer {
+	rewrittenCount: number
+	proxiedCount: number
+	skippedCount: number
+	unavailableCount: number
+	lastMode: ToolCompressionMode | ''
+	lastReason: string
+}
+
 export interface SessionCompressionTelemetry {
 	l01Prompt: CompressionTelemetryLayer
-	l02Tool: CompressionTelemetryLayer
+	l02Tool: ToolCompressionTelemetryLayer
 	l03Output: CompressionTelemetryLayer
 	l04Context: CompressionTelemetryLayer
 }

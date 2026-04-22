@@ -143,4 +143,5 @@ export interface PluginConfig {
 	cavememDataDir?: string
 	enableRtk?: boolean
 	rtkBinary?: string
+	rtkFallbackMode?: 'passthrough' | 'proxy'
 }

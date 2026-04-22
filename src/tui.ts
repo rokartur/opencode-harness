@@ -397,9 +397,41 @@ export function createBenchmarkSnapshotTool(
 }
 
 function formatTelemetry(layer: SessionRuntimeSnapshot['telemetry']['l01Prompt']): string {
-	if (layer.sampleCount === 0) return 'not observed'
+	const toolModes = formatToolCompressionModes(layer)
+	if (layer.sampleCount === 0) return toolModes ? `not observed; ${toolModes}` : 'not observed'
 	const percent = layer.baselineChars > 0 ? ((layer.savedChars / layer.baselineChars) * 100).toFixed(1) : '0.0'
-	return `baseline ${layer.baselineChars} -> ${layer.compressedChars} chars (~${estimateTokens(layer.baselineChars)} -> ~${estimateTokens(layer.compressedChars)} tok), saved ${layer.savedChars} (${percent}%), samples ${layer.sampleCount}, last ${layer.lastBaselineChars} -> ${layer.lastCompressedChars}`
+	const summary = `baseline ${layer.baselineChars} -> ${layer.compressedChars} chars (~${estimateTokens(layer.baselineChars)} -> ~${estimateTokens(layer.compressedChars)} tok), saved ${layer.savedChars} (${percent}%), samples ${layer.sampleCount}, last ${layer.lastBaselineChars} -> ${layer.lastCompressedChars}`
+	return toolModes ? `${summary}; ${toolModes}` : summary
+}
+
+function formatToolCompressionModes(layer: SessionRuntimeSnapshot['telemetry']['l01Prompt']): string {
+	if (!isToolCompressionLayer(layer)) return ''
+	const parts: string[] = []
+	if (layer.rewrittenCount > 0) parts.push(`rewritten ${layer.rewrittenCount}`)
+	if (layer.skippedCount > 0) parts.push(`skipped ${layer.skippedCount}`)
+	if (layer.proxiedCount > 0) parts.push(`proxied ${layer.proxiedCount}`)
+	if (layer.unavailableCount > 0) parts.push(`unavailable ${layer.unavailableCount}`)
+	if (layer.lastMode) {
+		parts.push(layer.lastReason ? `last ${layer.lastMode} (${layer.lastReason})` : `last ${layer.lastMode}`)
+	}
+	return parts.join(', ')
+}
+
+function isToolCompressionLayer(
+	layer: SessionRuntimeSnapshot['telemetry']['l01Prompt'],
+): layer is SessionRuntimeSnapshot['telemetry']['l02Tool'] {
+	return (
+		'rewrittenCount' in layer &&
+		typeof layer.rewrittenCount === 'number' &&
+		'skippedCount' in layer &&
+		typeof layer.skippedCount === 'number' &&
+		'proxiedCount' in layer &&
+		typeof layer.proxiedCount === 'number' &&
+		'unavailableCount' in layer &&
+		typeof layer.unavailableCount === 'number' &&
+		'lastMode' in layer &&
+		'lastReason' in layer
+	)
 }
 
 export function formatTelemetrySummary(snapshot: SessionRuntimeSnapshot): string {
