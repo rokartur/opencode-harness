@@ -172,4 +172,5 @@ export interface PluginConfig {
 	enableRtk?: boolean
 	rtkBinary?: string
 	rtkFallbackMode?: 'passthrough' | 'proxy'
+	workflowMode?: 'advisory' | 'strict'
 }

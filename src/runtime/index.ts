@@ -121,6 +121,34 @@ export {
 	type CommentCheckResult,
 } from './comment-checker.js'
 export {
+	WorkflowEngine,
+	formatWorkflowGateMessage,
+	isWorkflowMutationTool,
+	shouldDispatchVerification,
+} from './workflow-engine.js'
+export { reduceWorkflow } from './workflow-reducer.js'
+export { WorkflowStore } from './workflow-store.js'
+export {
+	buildWorkflowWorkPacket,
+	createWorkflowState,
+	getAllowedToolsForPhase,
+	getRemainingValidationCommands,
+	getWorkflowExitCondition,
+	getWorkflowPhaseLabel,
+	matchesAllowedWorkflowTool,
+	normalizeWorkflowCommand,
+	normalizeWorkflowState,
+	resolveLockedValidationCommand,
+	toWorkflowStatusSnapshot,
+	type WorkflowPhase,
+	type WorkflowRuntimeMode,
+	type WorkflowState,
+	type WorkflowStatusSnapshot,
+	type WorkflowToolGateResult,
+	type WorkflowWorkPacket,
+	type WorkflowEvent,
+} from './workflow-types.js'
+export {
 	getCodeStatsReport,
 	detectCodeStatsBackend,
 	resetCodeStatsBackendForTests,

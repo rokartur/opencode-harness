@@ -1,3 +1,5 @@
+import type { WorkflowStatusSnapshot } from './workflow-types.js'
+
 export type ConstraintKind = 'must' | 'avoid' | 'prefer' | 'use' | 'scope'
 
 export interface PromptConstraint {
@@ -86,6 +88,7 @@ export interface SessionRuntimeSnapshot {
 	phase: ExecutionPhase
 	compiledPrompt: CompiledPrompt | null
 	plan: ExecutionPlan | null
+	workflow?: WorkflowStatusSnapshot | null
 	nextStep: string
 	currentTarget: string
 	memoryProtocol: string

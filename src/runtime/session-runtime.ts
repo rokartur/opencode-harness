@@ -9,6 +9,7 @@ import type {
 	ToolCompressionTelemetryLayer,
 	VerificationRecord,
 } from './types.js'
+import type { WorkflowStatusSnapshot } from './workflow-types.js'
 
 export class SessionRuntimeTracker {
 	private phase: ExecutionPhase = 'load-context'
@@ -26,6 +27,7 @@ export class SessionRuntimeTracker {
 	private telemetry: SessionCompressionTelemetry = createEmptyTelemetry()
 	private verificationSummary: string[] = []
 	private verificationRecords: VerificationRecord[] = []
+	private workflow: WorkflowStatusSnapshot | null = null
 	private startedAt = Date.now()
 	private updatedAt = Date.now()
 
@@ -95,6 +97,11 @@ export class SessionRuntimeTracker {
 		this.updatedAt = Date.now()
 	}
 
+	setWorkflowSnapshot(workflow: WorkflowStatusSnapshot | null): void {
+		this.workflow = workflow ? cloneWorkflowSnapshot(workflow) : null
+		this.updatedAt = Date.now()
+	}
+
 	notePromptCompression(baselineChars: number, compressedChars: number): void {
 		recordTelemetry(this.telemetry.l01Prompt, baselineChars, compressedChars)
 		this.updatedAt = Date.now()
@@ -149,6 +156,7 @@ export class SessionRuntimeTracker {
 			phase: this.phase,
 			compiledPrompt: this.compiledPrompt,
 			plan: this.plan,
+			workflow: this.workflow ? cloneWorkflowSnapshot(this.workflow) : null,
 			nextStep: this.nextStep,
 			currentTarget: this.currentTarget,
 			memoryProtocol: this.memoryProtocol,
@@ -182,6 +190,7 @@ export class SessionRuntimeTracker {
 		this.telemetry = createEmptyTelemetry()
 		this.verificationSummary = []
 		this.verificationRecords = []
+		this.workflow = null
 		this.startedAt = Date.now()
 		this.updatedAt = Date.now()
 	}
@@ -258,5 +267,47 @@ function cloneTelemetry(telemetry: SessionCompressionTelemetry): SessionCompress
 		l02Tool: { ...telemetry.l02Tool },
 		l03Output: { ...telemetry.l03Output },
 		l04Context: { ...telemetry.l04Context },
+	}
+}
+
+function cloneWorkflowSnapshot(snapshot: WorkflowStatusSnapshot): WorkflowStatusSnapshot {
+	return {
+		...snapshot,
+		selectedTaskIds: [...snapshot.selectedTaskIds],
+		allowedTools: [...snapshot.allowedTools],
+		validationCommands: [...snapshot.validationCommands],
+		delegateChildren: [...snapshot.delegateChildren],
+		completedValidationCommands: [...snapshot.completedValidationCommands],
+		validationResults: { ...snapshot.validationResults },
+		verifyContract: [...snapshot.verifyContract],
+		workPacket: snapshot.workPacket
+			? {
+					...snapshot.workPacket,
+					selectedTaskIds: [...snapshot.workPacket.selectedTaskIds],
+					sourceArtifacts: [...snapshot.workPacket.sourceArtifacts],
+					acceptanceCriteria: [...snapshot.workPacket.acceptanceCriteria],
+					validationCommands: [...snapshot.workPacket.validationCommands],
+				}
+			: null,
+		executionPlan: snapshot.executionPlan
+			? {
+					...snapshot.executionPlan,
+					steps: snapshot.executionPlan.steps.map(step => ({
+						...step,
+						citations: [...step.citations],
+						acceptance: [...step.acceptance],
+					})),
+					sourceArtifacts: [...snapshot.executionPlan.sourceArtifacts],
+					memoryRefs: [...snapshot.executionPlan.memoryRefs],
+					validationCommands: [...snapshot.executionPlan.validationCommands],
+				}
+			: null,
+		compiledPrompt: snapshot.compiledPrompt
+			? {
+					...snapshot.compiledPrompt,
+					constraints: snapshot.compiledPrompt.constraints.map(constraint => ({ ...constraint })),
+					keywords: [...snapshot.compiledPrompt.keywords],
+				}
+			: null,
 	}
 }

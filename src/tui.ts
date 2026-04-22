@@ -6,7 +6,7 @@ import { dirExists } from './shared/fs.js'
 import { ensureDir, writeFileAtomic } from './shared/fs.js'
 import { statSync } from 'node:fs'
 import type { CompatibilityReport } from './shared/types.js'
-import type { SessionRuntimeSnapshot } from './runtime/index.js'
+import { getWorkflowPhaseLabel, type SessionRuntimeSnapshot } from './runtime/index.js'
 
 const z = tool.schema
 
@@ -260,6 +260,25 @@ export function createRuntimeStatusTool(
 			if (!snapshot) return 'No hybrid runtime state for this session.'
 
 			const lines: string[] = ['## Hybrid Runtime Status', '', `Phase: ${getDisplayPhase(snapshot)}`]
+			if (snapshot.workflow) {
+				lines.push(`Workflow mode: ${snapshot.workflow.workflowMode}`)
+				lines.push(`Workflow phase: ${getWorkflowPhaseLabel(snapshot.workflow.phase)}`)
+				lines.push(`Allowed tools: ${snapshot.workflow.allowedTools.join(', ') || 'none'}`)
+				lines.push(`Exit condition: ${snapshot.workflow.exitCondition}`)
+				if (snapshot.workflow.lastTransition) lines.push(`Last transition: ${snapshot.workflow.lastTransition}`)
+				if (snapshot.workflow.blockedReason) lines.push(`Blocked reason: ${snapshot.workflow.blockedReason}`)
+				if (snapshot.workflow.selectedTaskIds.length > 0) {
+					lines.push(`Selected tasks: ${snapshot.workflow.selectedTaskIds.join(', ')}`)
+				}
+				if (snapshot.workflow.verifyContract.length > 0) {
+					lines.push(`Verify contract: ${snapshot.workflow.verifyContract.join(' ; ')}`)
+				}
+				if (snapshot.workflow.specSyncStatus) lines.push(`Spec sync: ${snapshot.workflow.specSyncStatus}`)
+				if (snapshot.workflow.delegateChildren.length > 0) {
+					lines.push(`Delegate children: ${snapshot.workflow.delegateChildren.join(', ')}`)
+				}
+				if (snapshot.workflow.recoveryState) lines.push(`Recovery state: ${snapshot.workflow.recoveryState}`)
+			}
 			if (snapshot.phase !== getDisplayPhase(snapshot)) lines.push(`Internal phase: ${snapshot.phase}`)
 			if (snapshot.nextStep) lines.push(`Next step: ${snapshot.nextStep}`)
 			if (snapshot.currentTarget) lines.push(`Current target: ${snapshot.currentTarget}`)
@@ -481,6 +500,7 @@ function formatTaskCoverage(snapshot: SessionRuntimeSnapshot['plan']): string {
 }
 
 function getDisplayPhase(snapshot: SessionRuntimeSnapshot): string {
+	if (snapshot.workflow?.workflowMode === 'strict') return getWorkflowPhaseLabel(snapshot.workflow.phase)
 	const lastVerification = snapshot.verificationRecords.at(-1)
 	if (snapshot.phase === 'verify' && lastVerification?.status === 'pass') return 'done'
 	if (snapshot.phase === 'load-context') return 'load context'

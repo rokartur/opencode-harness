@@ -77,14 +77,20 @@ import {
 	GraphLiteService,
 	PendingTodosTracker,
 	ProgressiveCheckpointManager,
+	WorkflowEngine,
+	formatWorkflowGateMessage,
+	getWorkflowPhaseLabel,
+	isWorkflowMutationTool,
 	renderExecutionPlan,
 	resolveCaveKitSpecPath,
 	SessionPrimer,
 	SessionRetryManager,
+	shouldDispatchVerification,
 	summarizeExecutionPlan,
 	SnapshotManager,
 	SessionRuntimeTracker,
 	ToolArchiveManager,
+	toWorkflowStatusSnapshot,
 	upsertCaveKitSpec,
 	parseCaveKitSpec,
 	runDoctorProbes,
@@ -100,6 +106,7 @@ import {
 	CommentChecker,
 	detectAstGrepBinary,
 	getCodeStatsReport,
+	resolveLockedValidationCommand,
 } from './runtime/index.js'
 import { DelegateService, type DelegateSessionAdapter } from './runtime/delegate.js'
 import { CodeIntelService } from './runtime/code-intel.js'
@@ -366,6 +373,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		enableRtk: options?.enableRtk === true,
 		rtkBinary,
 		rtkFallbackMode,
+		workflowMode: options?.workflowMode === 'strict' ? 'strict' : 'advisory',
 	}
 
 	const cavememAvailable = config.enableCavememMcp ? isCavememAvailable(cavememBinary) : false
@@ -506,6 +514,10 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		severity: config.commentCheckerMode,
 		minViolations: config.commentCheckerMinViolations,
 	})
+	const workflowEngine = new WorkflowEngine({
+		dataDir: join(runtimeDataDir, 'workflow'),
+		workflowMode: config.workflowMode,
+	})
 	const qualitySignalsBySession = new Map<
 		string,
 		{
@@ -625,6 +637,16 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 		const summary = delegateService.renderSummary()
 		if (sessionID) getSessionRuntime(sessionID).setDelegateSummary(summary)
 		return summary
+	}
+
+	function syncWorkflowRuntime(sessionID: string): void {
+		if (!sessionID) return
+		const workflow = workflowEngine.getSnapshot(sessionID)
+		const runtime = getSessionRuntime(sessionID)
+		runtime.setWorkflowSnapshot(workflow)
+		if (!workflow) return
+		if (workflow.currentTarget) runtime.setCurrentTarget(workflow.currentTarget)
+		if (workflow.nextRequiredAction) runtime.setNextStep(workflow.nextRequiredAction)
 	}
 
 	function renderDelegateJob(job: {
@@ -1976,6 +1998,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				},
 				async execute(args, ctx) {
 					const runtime = getSessionRuntime(ctx.sessionID).snapshot()
+					const workflow = workflowEngine.getSnapshot(ctx.sessionID)
 					const latest = runtime.verificationRecords[runtime.verificationRecords.length - 1]
 					const verification = latest
 						? {
@@ -1987,7 +2010,10 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 							}
 						: null
 					if (!verification) return 'No verification record available for backprop.'
-					const changed = applyVerificationToSpec(runtime.plan, verification)
+					const changed = applyVerificationToSpec(
+						runtime.plan ?? workflow?.executionPlan ?? null,
+						verification,
+					)
 					return [
 						`Path: ${toDisplayPath(ctx.directory, resolveCaveKitSpecPath(ctx.directory))}`,
 						`Verification: ${verification.command} -> ${verification.status}`,
@@ -2069,21 +2095,25 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			openharness_runtime_status: createRuntimeStatusTool(sessionID => {
 				if (!sessionID) return null
 				refreshDelegateSummary(sessionID)
+				syncWorkflowRuntime(sessionID)
 				return getSessionRuntime(sessionID).snapshot()
 			}),
 			openharness_telemetry_snapshot: createTelemetrySnapshotTool(sessionID => {
 				if (!sessionID) return null
 				refreshDelegateSummary(sessionID)
+				syncWorkflowRuntime(sessionID)
 				return getSessionRuntime(sessionID).snapshot()
 			}),
 			openharness_benchmark_snapshot: createBenchmarkSnapshotTool(sessionID => {
 				if (!sessionID) return null
 				refreshDelegateSummary(sessionID)
+				syncWorkflowRuntime(sessionID)
 				return getSessionRuntime(sessionID).snapshot()
 			}),
 			openharness_caveman_stack_status: createRuntimeStatusTool(sessionID => {
 				if (!sessionID) return null
 				refreshDelegateSummary(sessionID)
+				syncWorkflowRuntime(sessionID)
 				return getSessionRuntime(sessionID).snapshot()
 			}),
 			openharness_doctor: toolFn({
@@ -2321,13 +2351,23 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			config.enableHooks ||
 			config.enableRtk ||
 			config.enableSnapshots === true ||
-			config.enableCommentChecker === true
+			config.enableCommentChecker === true ||
+			config.workflowMode === 'strict'
 				? async (hookInput, output) => {
 						maybeCaptureHarnessSnapshots(
 							hookInput.tool,
 							hookInput.sessionID,
 							(output.args ?? {}) as Record<string, unknown>,
 						)
+						const workflowGate = workflowEngine.gateTool(
+							hookInput.sessionID,
+							hookInput.tool,
+							(output.args ?? {}) as Record<string, unknown>,
+						)
+						if (!workflowGate.allowed) {
+							syncWorkflowRuntime(hookInput.sessionID)
+							throw new Error(formatWorkflowGateMessage(workflowGate, hookInput.tool))
+						}
 						if (config.enableHooks) {
 							const subject = hookInput.tool
 							const { blocked } = await runMatchingHooks(
@@ -2477,6 +2517,65 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				}
 				sessionRuntime.setCurrentTarget(touchedArtifacts[0] ?? '')
 			}
+			const workflowBefore = workflowEngine.getSnapshot(hookInput.sessionID)
+			const rawCommand = typeof hookInput.args?.command === 'string' ? hookInput.args.command : ''
+			const lockedValidationCommand = rawCommand
+				? workflowEngine.resolveValidationCommand(hookInput.sessionID, rawCommand)
+				: ''
+			if (isWorkflowMutationTool(hookInput.tool) && workflowBefore?.phase === 'edit') {
+				workflowEngine.dispatch(hookInput.sessionID, {
+					type: 'EDIT_APPLIED',
+					currentTarget: touchedArtifacts[0] ?? workflowBefore.currentTarget,
+				})
+			}
+			if (
+				hookInput.tool === 'bash' &&
+				lockedValidationCommand &&
+				(workflowBefore?.phase === 'run' || workflowBefore?.phase === 'verify')
+			) {
+				workflowEngine.dispatch(hookInput.sessionID, {
+					type: 'RUN_COMPLETED',
+					command: lockedValidationCommand,
+				})
+			}
+			if (hookInput.tool === 'openharness_delegate_start' && typeof toolOutput.output === 'string') {
+				const jobId = toolOutput.output.match(/^Job:\s*(\S+)/m)?.[1] ?? ''
+				const kind =
+					hookInput.args?.kind === 'index' ||
+					hookInput.args?.kind === 'review' ||
+					hookInput.args?.kind === 'research' ||
+					hookInput.args?.kind === 'custom'
+						? hookInput.args.kind
+						: 'custom'
+				if (jobId && workflowBefore?.phase === 'edit') {
+					workflowEngine.dispatch(hookInput.sessionID, {
+						type: 'DELEGATE_STARTED',
+						jobId,
+						kind,
+						parentPhase: workflowBefore.phase,
+					})
+				}
+			}
+			if (
+				(hookInput.tool === 'openharness_delegate_status' ||
+					hookInput.tool === 'openharness_delegate_continue' ||
+					hookInput.tool === 'openharness_delegate_cancel') &&
+				typeof hookInput.args?.id === 'string'
+			) {
+				const job = await delegateService.refresh(hookInput.args.id)
+				if (
+					job &&
+					(job.status === 'done' || job.status === 'failed' || job.status === 'cancelled') &&
+					workflowBefore?.phase.startsWith('delegate_')
+				) {
+					workflowEngine.dispatch(hookInput.sessionID, {
+						type: 'DELEGATE_COMPLETED',
+						jobId: job.id,
+						status: job.status,
+						result: job.status === 'failed' ? 'block' : 'advance',
+					})
+				}
+			}
 			if (
 				config.enablePendingTodoReminders === true &&
 				hookInput.tool === 'todowrite' &&
@@ -2493,11 +2592,19 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				checkpointManager.updateTodos(hookInput.sessionID, todos)
 			}
 			maybeRecordVerificationState(sessionState, sessionRuntime, hookInput, toolOutput)
-			const verification = classifyVerification({
-				tool: hookInput.tool,
-				args: hookInput.args ?? {},
-				output: { output: toolOutput.output, metadata: toolOutput.metadata },
-			})
+			const verification =
+				classifyVerification({
+					tool: hookInput.tool,
+					args: hookInput.args ?? {},
+					output: { output: toolOutput.output, metadata: toolOutput.metadata },
+				}) ??
+				(hookInput.tool === 'bash' && lockedValidationCommand
+					? createVerificationRecord(
+							lockedValidationCommand,
+							typeof toolOutput.output === 'string' ? toolOutput.output : '',
+							typeof toolOutput.metadata?.exitCode === 'number' ? toolOutput.metadata.exitCode : null,
+						)
+					: null)
 			if (verification) {
 				sessionRuntime.noteVerification(verification)
 				checkpointManager.recordVerification(hookInput.sessionID, verification.summary)
@@ -2517,10 +2624,32 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					}
 				}
 				if (cavekitMutatorMode === 'opencode-integrated') {
-					applyVerificationToSpec(sessionRuntime.snapshot().plan, verification)
+					applyVerificationToSpec(
+						sessionRuntime.snapshot().plan ??
+							workflowEngine.getSnapshot(hookInput.sessionID)?.executionPlan ??
+							null,
+						verification,
+					)
+				}
+				if (lockedValidationCommand && shouldDispatchVerification(verification.status)) {
+					workflowEngine.dispatch(hookInput.sessionID, {
+						type: 'VERIFY_COMPLETED',
+						command: lockedValidationCommand,
+						status: verification.status,
+					})
 				}
 			}
+			if (
+				hookInput.tool === 'openharness_cavekit_backprop' &&
+				workflowEngine.getSnapshot(hookInput.sessionID)?.phase === 'backprop'
+			) {
+				workflowEngine.dispatch(hookInput.sessionID, {
+					type: 'BACKPROP_COMPLETED',
+					outcome: 'blocked',
+				})
+			}
 			maybeSetNextStep(sessionState, sessionRuntime, hookInput)
+			syncWorkflowRuntime(hookInput.sessionID)
 		},
 
 		'experimental.session.compacting': async (hookInput, output) => {
@@ -2576,6 +2705,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				refreshDoctorSummary(sessionID)
 				if (config.enableQualityScorer === true) scoreSessionQuality(sessionID)
 				refreshRecoverySummary(sessionID)
+				syncWorkflowRuntime(sessionID)
 			}
 			const runtimeSnapshot = sessionID ? getSessionRuntime(sessionID).snapshot() : null
 			if (sessionID && sessionPrimer.isEnabled()) {
@@ -2640,7 +2770,10 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 
 			const allContext = [...rootContext, ...extraContexts, ...claudeRules]
 
-			if (runtimeSnapshot?.plan) {
+			if (config.workflowMode === 'strict' && sessionID) {
+				const workflowContract = workflowEngine.renderPhaseContract(sessionID)
+				if (workflowContract) output.system.push(workflowContract)
+			} else if (runtimeSnapshot?.plan) {
 				output.system.push(renderExecutionPlan(runtimeSnapshot.plan, runtimeSnapshot.phase))
 			}
 
@@ -2781,12 +2914,33 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				sessionPrimerBySession.set(hookInput.sessionID, primerSeed)
 				trimSessionCache(sessionPrimerBySession, MAX_SESSION_CACHE)
 				const compiledPrompt = compileUserPrompt(prompt)
+				workflowEngine.dispatch(hookInput.sessionID, {
+					type: 'USER_GOAL_RECEIVED',
+					goalHash: workflowEngine.createGoalHash(compiledPrompt.goal || compiledPrompt.normalized || prompt),
+					workflowMode: config.workflowMode ?? 'advisory',
+				})
 				sessionRuntime.setCompiledPrompt(compiledPrompt)
-				const planningRootContext = discoverRootContext(cwd, {
+				let planningRootContext = discoverRootContext(cwd, {
 					claudeMd: config.enableClaudeMdContext !== false,
 					agentsMd: config.enableAgentsMdContext !== false,
 					spec: config.enableCavekitSpecContext !== false,
 				})
+				if (config.workflowMode === 'strict' && fileExists(resolveCaveKitSpecPath(cwd))) {
+					try {
+						const strictBuild = buildCaveKitPlan(cwd, {
+							focus: prompt,
+							limit: 3,
+							markActive: true,
+						})
+						planningRootContext = planningRootContext.map(ctx =>
+							ctx.label === 'CaveKit Spec'
+								? { ...ctx, content: strictBuild.content, source: strictBuild.path }
+								: ctx,
+						)
+					} catch {
+						// keep advisory-style root context when strict build cannot be prepared
+					}
+				}
 				const planningMemories = config.enableMemory
 					? await recallProjectMemories(prompt, cwd, hookInput.sessionID, 3)
 					: []
@@ -2811,6 +2965,14 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 										.map(r => ({ symbolName: r.symbol.name, filePath: r.filePath })),
 								)
 						: []
+				workflowEngine.dispatch(hookInput.sessionID, {
+					type: 'CONTEXT_READY',
+					currentTarget: discoveryHints[0] ?? graphBlastRadiusFiles[0] ?? graphCochangeHints[0]?.path ?? '',
+				})
+				workflowEngine.dispatch(hookInput.sessionID, {
+					type: 'PROMPT_COMPILED',
+					compiledPrompt,
+				})
 				const sessionState = getSessionState(hookInput.sessionID)
 				const plan = buildExecutionPlan({
 					compiledPrompt,
@@ -2823,6 +2985,10 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					graphSymbolMatches,
 				})
 				sessionRuntime.setPlan(plan)
+				workflowEngine.dispatch(hookInput.sessionID, {
+					type: 'PLAN_READY',
+					plan,
+				})
 				sessionState.updateGoal(plan.goal)
 				setSessionNextStep(
 					hookInput.sessionID,
@@ -2844,9 +3010,11 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 					}),
 				)
 				trimSessionCache(sessionPrimerBySession, MAX_SESSION_CACHE)
+				syncWorkflowRuntime(hookInput.sessionID)
 			} else if (hookInput.messageID) {
 				getSessionState(hookInput.sessionID)
 				getSessionRuntime(hookInput.sessionID)
+				syncWorkflowRuntime(hookInput.sessionID)
 			}
 		},
 
@@ -2854,19 +3022,38 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 			const type = event.type as string
 			const sessionId = extractSessionId(event)
 			if (type === 'session.error' && sessionId) {
+				const sourcePhase = workflowEngine.getSnapshot(sessionId)?.phase
+				workflowEngine.dispatch(sessionId, {
+					type: 'RECOVERY_REQUIRED',
+					classification: sessionRecoveryManager.classifyError(event as Record<string, unknown>),
+					sourcePhase,
+				})
 				if (config.enableSessionRecovery === true) {
 					const lastRetryPrompt = lastPromptBySession.has(sessionId)
 						? { messageID: `recovery-${Date.now()}`, text: lastPromptBySession.get(sessionId) ?? '' }
 						: undefined
-					await sessionRecoveryManager.handleSessionError(
+					const recovered = await sessionRecoveryManager.handleSessionError(
 						event as Record<string, unknown>,
 						sessionId,
 						lastRetryPrompt,
 					)
+					workflowEngine.dispatch(sessionId, {
+						type: 'RECOVERY_COMPLETED',
+						success: recovered,
+						restorePhase: sourcePhase,
+						message: recovered ? 'recovery restored prior phase' : 'recovery exhausted retry budget',
+					})
 					refreshRecoverySummary(sessionId)
 				} else {
 					await sessionRetryManager.handleSessionError(event as Record<string, unknown>, sessionId)
+					workflowEngine.dispatch(sessionId, {
+						type: 'RECOVERY_COMPLETED',
+						success: false,
+						restorePhase: sourcePhase,
+						message: 'session recovery disabled; retry manager handled the error',
+					})
 				}
+				syncWorkflowRuntime(sessionId)
 			}
 			if (config.enableCavememBridge !== false && type === 'session.created' && sessionId) {
 				startCaveMemSession(sessionId, cwd, getCaveMemRuntimeOptions(sessionId))
@@ -2877,6 +3064,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 				runtime.setPhase('load-context')
 				runtime.setMemoryProtocol(describeMemoryProtocol())
 				refreshDoctorSummary(sessionId)
+				syncWorkflowRuntime(sessionId)
 			}
 
 			if (
@@ -2931,6 +3119,7 @@ export const OpenHarnessCompatPlugin: Plugin = async (input, options) => {
 						message: buildRuntimeOpsLogSummary(sessionId, runtimeSnapshot),
 					},
 				})
+				workflowEngine.clear(sessionId)
 				clearSession(sessionId)
 			}
 		},
@@ -3090,8 +3279,12 @@ function buildSessionSummary(sessionState: SessionStateTracker, lastPrompt: stri
 }
 
 function buildRuntimeOpsLogSummary(sessionID: string, snapshot: ReturnType<SessionRuntimeTracker['snapshot']>): string {
-	const parts = [`session=${sessionID}`, `phase=${snapshot.phase}`]
+	const workflowPhase = snapshot.workflow?.phase
+		? getWorkflowPhaseLabel(snapshot.workflow.phase).replace(/\s+/g, '_')
+		: ''
+	const parts = [`session=${sessionID}`, `phase=${workflowPhase || snapshot.phase}`]
 	if (snapshot.plan) parts.push(`mode=${snapshot.plan.mode}`, `goal=${truncateStr(snapshot.plan.goal, 80)}`)
+	if (snapshot.workflow?.workflowMode) parts.push(`workflow=${snapshot.workflow.workflowMode}`)
 	if (snapshot.nextStep) parts.push(`next=${truncateStr(snapshot.nextStep, 80)}`)
 	if (snapshot.currentTarget) parts.push(`target=${truncateStr(snapshot.currentTarget, 80)}`)
 	if (snapshot.memoryProtocol) parts.push(`memproto=${snapshot.memoryProtocol}`)
